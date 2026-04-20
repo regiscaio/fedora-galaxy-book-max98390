@@ -1,4 +1,4 @@
-# fedora-galaxy-book-max98390
+# Galaxy Book MAX98390
 
 ## Instalação rápida
 
