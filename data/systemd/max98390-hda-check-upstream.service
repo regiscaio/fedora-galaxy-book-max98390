@@ -1,0 +1,11 @@
+[Unit]
+Description=Check if native MAX98390 HDA support has landed upstream
+After=multi-user.target
+ConditionPathExists=/usr/libexec/galaxybook-max98390/max98390-hda-check-upstream.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/galaxybook-max98390/max98390-hda-check-upstream.sh
+
+[Install]
+WantedBy=multi-user.target
