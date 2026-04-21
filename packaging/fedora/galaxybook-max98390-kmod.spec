@@ -100,5 +100,3 @@ fi
 %{_unitdir}/max98390-hda-check-upstream.service
 
 %changelog
-* Mon Apr 20 2026 Caio Régis <regiscaio@users.noreply.github.com> - 1.0.0-1
-- Add the initial Fedora akmod packaging for the MAX98390 speaker fix
