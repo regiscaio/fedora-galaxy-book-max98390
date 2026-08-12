@@ -7,6 +7,7 @@ REPO_ROOT="$(cd -- "$TEST_DIR/.." && pwd)"
 SPEC="$REPO_ROOT/packaging/fedora/galaxybook-max98390-kmod.spec"
 PRESET="$REPO_ROOT/data/systemd-preset/80-galaxybook-max98390.preset"
 FINALIZER="$REPO_ROOT/scripts/max98390-kmod-finalize.sh"
+LIFECYCLE_LOCK="$REPO_ROOT/scripts/kmod-lifecycle-lock.sh"
 FINALIZER_SERVICE="$REPO_ROOT/data/systemd/max98390-kmod-finalize.service"
 FINALIZER_PATH="$REPO_ROOT/data/systemd/max98390-kmod-finalize.path"
 SETUP_SERVICE="$REPO_ROOT/data/systemd/max98390-hda-i2c-setup.service"
@@ -103,6 +104,8 @@ test_finalizer_is_ordered_and_transaction_safe() {
         'I2C setup is not ordered after module finalization'
     assert_file_contains_fixed "$FINALIZER" '"$FLOCK_COMMAND" --fcntl --shared' \
         'finalizer does not hold the RPM-compatible read lock'
+    assert_file_contains_fixed "$FINALIZER" 'acquire_kmod_lifecycle_lock' \
+        'finalizer does not acquire the cross-driver lifecycle lock'
     assert_file_not_contains_fixed "$SPEC" '%transfiletriggerun' \
         'package erase can trigger destructive module cleanup'
 }
@@ -230,6 +233,9 @@ test_built_common_rpm_contains_preset() {
         '/usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh' \
         'common RPM payload lacks the finalizer helper'
     assert_file_contains_fixed "$output" \
+        '/usr/libexec/galaxybook-max98390/kmod-lifecycle-lock.sh' \
+        'common RPM payload lacks the cross-driver lifecycle lock helper'
+    assert_file_contains_fixed "$output" \
         '/usr/lib/systemd/system/max98390-kmod-finalize.path' \
         'common RPM payload lacks the finalizer path unit'
     assert_file_contains_fixed "$output" \
@@ -241,10 +247,28 @@ test_built_common_rpm_contains_preset() {
     assert_file_contains_fixed "$output" \
         '/var/lib/galaxybook-max98390/deferred' \
         'common RPM payload lacks the deferred retry directory'
-    for dependency in bash rpm systemd util-linux-core; do
+    for dependency in bash coreutils rpm systemd util-linux-core; do
         assert_file_contains_fixed "$requires" "$dependency" \
             "common RPM lacks runtime dependency $dependency"
     done
+}
+
+test_lifecycle_lock_contract_is_packaged() {
+    assert_file_contains_fixed "$LIFECYCLE_LOCK" \
+        'kmod_lifecycle_lock_path="/run/lock/galaxybook-kmod-lifecycle.lock"' \
+        'lifecycle helper does not use the fixed cross-driver lock path'
+    assert_file_contains_fixed "$LIFECYCLE_LOCK" \
+        'kmod_lifecycle_lock_timeout_seconds="600"' \
+        'lifecycle helper does not bound lock contention'
+    assert_file_contains_fixed "$LIFECYCLE_LOCK" \
+        'GALAXYBOOK_KMOD_LIFECYCLE_LOCK_FD' \
+        'lifecycle helper cannot authenticate an inherited descriptor'
+    assert_file_contains_fixed "$SPEC" \
+        'scripts/kmod-lifecycle-lock.sh' \
+        'spec does not install the cross-driver lifecycle helper'
+    assert_file_contains_fixed "$SPEC" \
+        '%{_libexecdir}/%{prjname}/kmod-lifecycle-lock.sh' \
+        'spec does not own the installed cross-driver lifecycle helper'
 }
 
 run_test_cases \
@@ -257,4 +281,5 @@ run_test_cases \
     kmodtool_generates_kernel_payload_manifest \
     rpmspec_expands_per_kernel_payload \
     built_rpm_contains_both_modules \
-    built_common_rpm_contains_preset
+    built_common_rpm_contains_preset \
+    lifecycle_lock_contract_is_packaged

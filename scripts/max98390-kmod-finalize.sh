@@ -3,6 +3,10 @@
 set -euo pipefail
 export LC_ALL=C
 
+FINALIZER_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kmod-lifecycle-lock.sh
+source "$FINALIZER_SCRIPT_DIR/kmod-lifecycle-lock.sh"
+
 MODULE_ROOT="${MAX98390_MODULE_ROOT:-/lib/modules}"
 STATE_ROOT="${MAX98390_FINALIZE_STATE_ROOT:-/var/lib/galaxybook-max98390}"
 PENDING_DIR="${STATE_ROOT}/pending"
@@ -559,6 +563,15 @@ finalize_kernel() (
         return 1
     fi
 
+    # The global Galaxy Book lifecycle lock serializes depmod (and the dracut
+    # work performed by sibling drivers) across independently triggered
+    # workers. It must precede both the MAX98390-private lock and RPM's shared
+    # OFD lock so every participant has one consistent lock hierarchy.
+    if ! acquire_kmod_lifecycle_lock; then
+        error "Could not acquire the global kernel-module lifecycle lock"
+        return 1
+    fi
+
     # The public --kernel API bypasses process_pending(), so authenticate the
     # durable state roots here before reading or acknowledging any marker.
     ensure_state_directories || return 1
@@ -590,6 +603,10 @@ finalize_kernel() (
     fi
     validate_open_private_lock "$lock_file" "$lock_fd" || return 1
     acquire_rpm_read_lock || return 1
+    validate_kmod_lifecycle_lock || {
+        error "Global kernel-module lifecycle lock changed before finalization"
+        return 1
+    }
 
     for marker in \
         "${PENDING_DIR}/${kernel}.pending" \
@@ -686,6 +703,11 @@ finalize_kernel() (
             log "A newer finalization request remains queued for $kernel"
         fi
     done
+
+    validate_kmod_lifecycle_lock || {
+        error "Global kernel-module lifecycle lock changed before completion"
+        return 1
+    }
 
     log "MAX98390 kernel finalization completed for $kernel"
 )

@@ -33,6 +33,15 @@ source "$FINALIZER"
 mkdir -p "$TEST_ROOT/locks"
 : > "$MAX98390_RPM_LOCK_PATH"
 
+# The production path is deliberately fixed. Unit tests source the canonical
+# helper and replace its internal fixture values without exposing a runtime
+# environment override.
+kmod_lifecycle_lock_path="$TEST_ROOT/locks/global.lock"
+kmod_lifecycle_lock_timeout_seconds=5
+kmod_lifecycle_lock_expected_uid="$(id -u)"
+kmod_lifecycle_lock_expected_gid="$(id -g)"
+kmod_lifecycle_lock_ancestry=("$TEST_ROOT" "$TEST_ROOT/locks")
+
 FAKE_PAYLOAD_OWNER=""
 FAKE_LEGACY_OWNER=""
 FAKE_WRONG_VERMAGIC=0
@@ -41,19 +50,23 @@ FAKE_BLOCK_REQUEST="$TEST_ROOT/block-request"
 FAKE_BLOCK_ENTERED="$TEST_ROOT/block-entered"
 FAKE_BLOCK_RELEASE="$TEST_ROOT/block-release"
 FAKE_RPM_CALLS="$TEST_ROOT/rpm-calls"
+FAKE_MODINFO_CALLS="$TEST_ROOT/modinfo-calls"
 FAKE_DEPMOD_CALLS="$TEST_ROOT/depmod-calls"
+FAKE_LIFECYCLE_EVENTS="$TEST_ROOT/lifecycle-events"
 FAKE_SLEEP_CALLS="$TEST_ROOT/sleep-calls"
 FAKE_SYSTEMCTL_CALLS="$TEST_ROOT/systemctl-calls"
 FAKE_RUNNING_KERNEL="test-running.x86_64"
 FAKE_LEGACY_SWAP_SOURCE=""
 FAKE_LEGACY_SWAP_TRIGGER=""
 FAKE_LEGACY_SWAP_REPLACEMENT=""
+FAKE_ASSERT_GLOBAL_HELD=0
 
 fake_rpm() {
     local path="${*: -1}"
     local remaining=0
 
     printf '%s\n' "$path" >> "$FAKE_RPM_CALLS"
+    printf '%s\n' rpm-query >> "$FAKE_LIFECYCLE_EVENTS"
     if [[ -n "$FAKE_LEGACY_SWAP_TRIGGER" \
         && "$path" == "$FAKE_LEGACY_SWAP_TRIGGER" ]]; then
         mv -fT -- "$FAKE_LEGACY_SWAP_REPLACEMENT" "$FAKE_LEGACY_SWAP_SOURCE"
@@ -96,6 +109,9 @@ fake_rpm() {
 fake_modinfo() {
     local path module kernel
 
+    printf '%s\n' modinfo >> "$FAKE_MODINFO_CALLS"
+    printf '%s\n' modinfo >> "$FAKE_LIFECYCLE_EVENTS"
+
     if [[ "$1" == -F && "$2" == vermagic ]]; then
         path="${*: -1}"
         kernel="${path#"$MODULE_ROOT/"}"
@@ -120,9 +136,26 @@ fake_modinfo() {
 
 fake_depmod() {
     printf '%s\n' "$*" >> "$FAKE_DEPMOD_CALLS"
+    printf '%s\n' depmod >> "$FAKE_LIFECYCLE_EVENTS"
+    if (( FAKE_ASSERT_GLOBAL_HELD == 1 )) \
+        && /usr/bin/flock --exclusive --nonblock \
+            "$kmod_lifecycle_lock_path" true; then
+        printf 'depmod entered without the global lifecycle lock\n' >&2
+        return 91
+    fi
 }
 
 fake_flock() {
+    if [[ " $* " == *' --fcntl --shared '* ]]; then
+        printf '%s\n' rpm-lock >> "$FAKE_LIFECYCLE_EVENTS"
+    elif [[ "$1" == -x ]]; then
+        printf '%s\n' private-lock >> "$FAKE_LIFECYCLE_EVENTS"
+    fi
+    /usr/bin/flock "$@"
+}
+
+fake_global_flock() {
+    printf 'global-lock %s\n' "$*" >> "$FAKE_LIFECYCLE_EVENTS"
     /usr/bin/flock "$@"
 }
 
@@ -146,6 +179,7 @@ FLOCK_COMMAND=fake_flock
 SLEEP_COMMAND=fake_sleep
 SYSTEMCTL_COMMAND=fake_systemctl
 UNAME_COMMAND=fake_uname
+kmod_lifecycle_lock_flock_command=fake_global_flock
 
 new_kernel_fixture() {
     local kernel="$1"
@@ -753,6 +787,140 @@ test_rpm_lock_revalidates_group_mode_and_link_count() {
     FLOCK_COMMAND="$original_flock_command"
 }
 
+test_global_lock_precedes_private_and_rpm_and_covers_ack() {
+    local kernel=7.1.8-global-order.x86_64
+    local global_line private_line rpm_line depmod_line final_global_line
+
+    new_kernel_fixture "$kernel"
+    queue_kernel "$kernel" >/dev/null
+    : > "$FAKE_LIFECYCLE_EVENTS"
+    FAKE_ASSERT_GLOBAL_HELD=1
+    finalize_kernel "$kernel" >/dev/null
+    FAKE_ASSERT_GLOBAL_HELD=0
+
+    global_line="$(grep -n -m1 '^global-lock ' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    private_line="$(grep -n -m1 '^private-lock$' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    rpm_line="$(grep -n -m1 '^rpm-lock$' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    depmod_line="$(grep -n -m1 '^depmod$' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    final_global_line="$(grep -n '^global-lock ' "$FAKE_LIFECYCLE_EVENTS" | tail -1 | cut -d: -f1)"
+
+    [[ "$global_line" =~ ^[0-9]+$ && "$private_line" =~ ^[0-9]+$ \
+        && "$rpm_line" =~ ^[0-9]+$ && "$depmod_line" =~ ^[0-9]+$ \
+        && "$final_global_line" =~ ^[0-9]+$ ]]
+    (( global_line < private_line && private_line < rpm_line ))
+    (( rpm_line < depmod_line && depmod_line < final_global_line ))
+    assert_missing "${PENDING_DIR}/${kernel}.pending"
+}
+
+test_global_lock_contention_has_zero_finalization_side_effects() {
+    local kernel=7.1.8-global-contention.x86_64 legacy
+    local holder_pid attempt unexpected_success=0
+    local ready="$TEST_ROOT/global-holder.ready"
+    local release="$TEST_ROOT/global-holder.release"
+
+    new_kernel_fixture "$kernel"
+    legacy="$(legacy_path "$kernel" "$CORE_MODULE")"
+    queue_kernel "$kernel" >/dev/null
+    : > "$FAKE_RPM_CALLS"
+    : > "$FAKE_MODINFO_CALLS"
+    : > "$FAKE_DEPMOD_CALLS"
+    rm -f -- "$ready" "$release"
+    kmod_lifecycle_lock_timeout_seconds=1
+    : > "$kmod_lifecycle_lock_path"
+    chmod 0600 "$kmod_lifecycle_lock_path"
+
+    (
+        local holder_fd
+        exec {holder_fd}<>"$kmod_lifecycle_lock_path"
+        /usr/bin/flock --exclusive "$holder_fd"
+        : > "$ready"
+        while [[ ! -f "$release" ]]; do
+            /usr/bin/sleep 0.01
+        done
+    ) &
+    holder_pid=$!
+    for ((attempt = 1; attempt <= 200; attempt++)); do
+        [[ -f "$ready" ]] && break
+        /usr/bin/sleep 0.01
+    done
+    [[ -f "$ready" ]]
+
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        unexpected_success=1
+    fi
+    : > "$release"
+    wait "$holder_pid"
+
+    (( unexpected_success == 0 ))
+    [[ ! -s "$FAKE_RPM_CALLS" && ! -s "$FAKE_MODINFO_CALLS" \
+        && ! -s "$FAKE_DEPMOD_CALLS" ]]
+    [[ -f "$legacy" && -f "${PENDING_DIR}/${kernel}.pending" ]]
+    assert_missing "${LOCK_ROOT}/galaxybook-max98390-${kernel}.lock"
+    rm -f -- "${PENDING_DIR}/${kernel}.pending"
+}
+
+test_unsafe_global_lock_has_zero_finalization_side_effects() {
+    local mode kernel legacy safe_target
+
+    for mode in metadata symlink; do
+        kernel="7.1.8-global-${mode}.x86_64"
+        new_kernel_fixture "$kernel"
+        legacy="$(legacy_path "$kernel" "$CORE_MODULE")"
+        queue_kernel "$kernel" >/dev/null
+        : > "$FAKE_RPM_CALLS"
+        : > "$FAKE_MODINFO_CALLS"
+        : > "$FAKE_DEPMOD_CALLS"
+
+        case "$mode" in
+            metadata)
+                chmod 0666 "$kmod_lifecycle_lock_path"
+                ;;
+            symlink)
+                safe_target="$TEST_ROOT/global-safe-target"
+                rm -f -- "$kmod_lifecycle_lock_path" "$safe_target"
+                : > "$safe_target"
+                chmod 0600 "$safe_target"
+                ln -s "$safe_target" "$kmod_lifecycle_lock_path"
+                ;;
+        esac
+
+        if finalize_kernel "$kernel" >/dev/null 2>&1; then
+            printf 'unsafe global lock was accepted (%s)\n' "$mode" >&2
+            return 1
+        fi
+        [[ ! -s "$FAKE_RPM_CALLS" && ! -s "$FAKE_MODINFO_CALLS" \
+            && ! -s "$FAKE_DEPMOD_CALLS" ]]
+        [[ -f "$legacy" && -f "${PENDING_DIR}/${kernel}.pending" ]]
+        assert_missing "${LOCK_ROOT}/galaxybook-max98390-${kernel}.lock"
+        rm -f -- "${PENDING_DIR}/${kernel}.pending" "$kmod_lifecycle_lock_path"
+        : > "$kmod_lifecycle_lock_path"
+        chmod 0600 "$kmod_lifecycle_lock_path"
+    done
+}
+
+test_inherited_global_lock_is_reused_before_private_and_rpm() {
+    local kernel=7.1.8-global-inherited.x86_64 inherited_fd
+    local first_event private_line rpm_line
+
+    new_kernel_fixture "$kernel"
+    acquire_kmod_lifecycle_lock
+    inherited_fd="$GALAXYBOOK_KMOD_LIFECYCLE_LOCK_FD"
+    : > "$FAKE_LIFECYCLE_EVENTS"
+
+    finalize_kernel "$kernel" >/dev/null
+
+    first_event="$(sed -n '1p' "$FAKE_LIFECYCLE_EVENTS")"
+    private_line="$(grep -n -m1 '^private-lock$' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    rpm_line="$(grep -n -m1 '^rpm-lock$' "$FAKE_LIFECYCLE_EVENTS" | cut -d: -f1)"
+    [[ "$first_event" == 'global-lock --exclusive --nonblock '* ]]
+    [[ "$first_event" != *'--timeout'* ]]
+    (( private_line < rpm_line ))
+    validate_kmod_lifecycle_lock
+
+    exec {inherited_fd}>&-
+    unset GALAXYBOOK_KMOD_LIFECYCLE_LOCK_FD
+}
+
 test_finalizer_validates_then_removes_unmanaged_legacy
 test_owner_or_vermagic_failure_preserves_legacy
 test_rpm_owned_legacy_is_preserved
@@ -772,5 +940,9 @@ test_private_lock_rejects_symlink_and_wrong_owner_contract
 test_private_lock_revalidates_group_mode_and_link_count_after_open
 test_rpm_lock_rejects_symlink_and_wrong_owner_contract
 test_rpm_lock_revalidates_group_mode_and_link_count
+test_global_lock_precedes_private_and_rpm_and_covers_ack
+test_global_lock_contention_has_zero_finalization_side_effects
+test_unsafe_global_lock_has_zero_finalization_side_effects
+test_inherited_global_lock_is_reused_before_private_and_rpm
 
 printf 'test_kmod_finalize: ok\n'

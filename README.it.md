@@ -35,6 +35,8 @@ Questo repository organizza quel supporto nel modo tipico di Fedora:
 - una coda persistente che finalizza ogni nuovo kmod dopo la transazione RPM,
   con proprietario, `vermagic`, `depmod` e risoluzione validati prima di
   rimuovere qualsiasi override legacy non gestito;
+- un mutex globale autenticato che serializza la manutenzione degli indici dei
+  moduli con gli altri driver Galaxy Book, anche durante un `dracut` parallelo;
 - un servizio di boot che attende `akmods`, carica esplicitamente entrambi i
   moduli e crea i dispositivi I2C mancanti;
 - tentativi limitati mentre ACPI, I2C, i moduli e gli amplificatori diventano
@@ -118,7 +120,7 @@ Ripetere questa convalida dopo ogni aggiornamento del kernel. La prova definitiv
 rimane la riproduzione di audio tramite gli altoparlanti interni dopo l'avvio
 con il nuovo kernel.
 
-Dalla versione `1.00.10`, le integrazioni che hanno completato la build di un
+Dalla versione `1.00.11`, le integrazioni che hanno completato la build di un
 kernel possono attendere la finalizzazione completa fuori dalla transazione RPM:
 
 ```bash
@@ -130,6 +132,15 @@ Il comando restituisce successo solo dopo aver validato proprietari RPM e
 `vermagic` esatti per entrambi i moduli, rimosso esclusivamente override legacy
 senza proprietario, eseguito `depmod` e confermato la risoluzione esatta. La coda
 automatica usa lo stesso contratto e conserva le richieste interrotte.
+
+Prima del lock privato MAX98390 e del lock condiviso di RPM, il finalizzatore
+acquisisce il mutex BSD esclusivo
+`/run/lock/galaxybook-kmod-lifecycle.lock`. Un'integrazione coordinatrice può
+ereditare il descrittore autenticato, che resta valido fino alla conferma del
+marcatore. Vengono riconvalidati antenati, proprietario, modo `0600`, numero di
+hardlink e identità `device:inode` tra path e FD. L'attesa è limitata a dieci
+minuti; un errore di acquisizione conserva la coda e impedisce l'avvio di
+`depmod` o della pulizia.
 
 ## Ambito
 
@@ -170,3 +181,7 @@ make rpm
 sorgente e i pacchetti di ingresso del flusso akmod; il payload caricabile e
 specifico del kernel viene prodotto quando `akmods` compila per quella versione.
 Gli artefatti locali vengono salvati in `dist/`.
+
+Il target `install` di `module/Makefile` esiste solo per lo sviluppo e non
+partecipa al mutex di lifecycle. In produzione si devono usare esclusivamente
+gli RPM/akmods e il finalizzatore pacchettizzato.

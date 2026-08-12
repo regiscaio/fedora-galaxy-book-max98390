@@ -7,6 +7,7 @@ failures=0
 
 for test_script in \
     "$TEST_DIR/test_i2c_setup.sh" \
+    "$TEST_DIR/test_kmod_lifecycle_lock.sh" \
     "$TEST_DIR/test_kmod_finalize.sh" \
     "$TEST_DIR/test_packaging.sh" \
     "$TEST_DIR/test_rpm6_locking.sh"; do

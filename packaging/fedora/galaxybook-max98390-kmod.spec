@@ -75,6 +75,8 @@ install -m 0755 scripts/max98390-hda-check-upstream.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
 install -m 0755 scripts/max98390-kmod-finalize.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
+install -m 0644 scripts/kmod-lifecycle-lock.sh \
+  %{buildroot}%{_libexecdir}/%{prjname}/kmod-lifecycle-lock.sh
 install -Dm0644 data/systemd/max98390-hda-i2c-setup.service \
   %{buildroot}%{_unitdir}/max98390-hda-i2c-setup.service
 install -Dm0644 data/systemd/max98390-hda-check-upstream.service \
@@ -115,6 +117,7 @@ done
 %{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 %{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
 %{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
+%{_libexecdir}/%{prjname}/kmod-lifecycle-lock.sh
 %{_unitdir}/max98390-hda-i2c-setup.service
 %{_unitdir}/max98390-hda-check-upstream.service
 %{_unitdir}/max98390-kmod-finalize.path

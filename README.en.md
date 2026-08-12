@@ -35,6 +35,8 @@ This repository organizes that support in the Fedora way:
 - a durable queue that finalizes each new kmod only after the RPM transaction
   ends, validating owner, `vermagic`, `depmod`, and resolution before removing
   any unmanaged legacy override;
+- an authenticated global mutex that serializes module-index maintenance with
+  other Galaxy Book drivers, including while a sibling runs `dracut`;
 - a boot service that waits for `akmods`, explicitly loads both modules, and
   creates the missing I2C devices;
 - bounded retries while ACPI, I2C, the modules, and the amplifiers become
@@ -115,7 +117,7 @@ problem and leaves the file outside RPM management.
 Repeat this validation after every kernel update. The definitive test remains
 playing audio through the internal speakers after booting the new kernel.
 
-Since version `1.00.10`, integrations that have completed a kernel build can
+Since version `1.00.11`, integrations that have completed a kernel build can
 wait for full finalization outside the RPM transaction with:
 
 ```bash
@@ -127,6 +129,14 @@ The command succeeds only after validating both exact RPM owners and
 `vermagic` values, removing only ownerless legacy overrides, running `depmod`,
 and confirming exact resolution of both modules. The automatic queue uses the
 same contract and retains interrupted requests for retry.
+
+Before the MAX98390-private lock and RPM's shared lock, the finalizer acquires
+the exclusive BSD mutex `/run/lock/galaxybook-kmod-lifecycle.lock`. An
+authenticated descriptor can be inherited from a coordinating integration and
+remains valid through marker acknowledgement. Ancestry, owner, mode `0600`,
+hard-link count, and the path/FD `device:inode` identity are revalidated. The
+wait is bounded to ten minutes; acquisition failures retain the queue and
+prevent `depmod` or cleanup from starting.
 
 ## Scope
 
@@ -167,3 +177,7 @@ make rpm
 package and the entry packages for the akmod flow; the loadable,
 kernel-specific payload is produced when `akmods` builds for that release.
 Local artifacts are placed in `dist/`.
+
+The `module/Makefile` `install` target is development-only and does not
+participate in the lifecycle mutex. Production systems must use the RPM/akmod
+flow and the packaged finalizer exclusively.

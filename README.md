@@ -35,6 +35,8 @@ Este repositório organiza esse suporte no padrão Fedora:
 - fila durável que finaliza cada novo kmod somente depois que a transação RPM
   termina, com owner, `vermagic`, `depmod` e resolução validados antes de
   remover qualquer override legado não gerenciado;
+- mutex global autenticado que serializa a manutenção dos índices de módulos
+  com outros drivers Galaxy Book, inclusive durante um `dracut` concorrente;
 - serviço de boot que aguarda o `akmods`, carrega os dois módulos explicitamente
   e cria os dispositivos I2C ausentes;
 - tentativas limitadas enquanto ACPI, I2C, módulos e amplificadores ficam
@@ -118,7 +120,7 @@ Repita essa validação após uma atualização de kernel. O teste definitivo
 continua sendo reproduzir áudio nos alto-falantes internos depois de reiniciar
 no novo kernel.
 
-Desde a versão `1.00.10`, integrações que já terminaram o build de um kernel
+Desde a versão `1.00.11`, integrações que já terminaram o build de um kernel
 podem aguardar a finalização completa, fora da transação RPM, com:
 
 ```bash
@@ -130,6 +132,15 @@ O comando só retorna sucesso depois de validar os dois owners RPM e
 `vermagic`, remover apenas overrides legados sem owner, executar `depmod` e
 confirmar a resolução exata dos dois módulos. A fila automática usa o mesmo
 contrato e preserva pedidos interrompidos para retry.
+
+Antes do lock privado do MAX98390 e do lock compartilhado do RPM, o
+finalizador adquire o mutex BSD exclusivo
+`/run/lock/galaxybook-kmod-lifecycle.lock`. O descritor autenticado pode ser
+herdado por uma integração coordenadora e permanece válido até o reconhecimento
+do marcador. Ancestrais, owner, modo `0600`, número de hardlinks e identidade
+`device:inode` entre path e FD são revalidados. A espera é limitada a dez
+minutos; falhas de aquisição preservam a fila e impedem que `depmod` ou a
+limpeza comecem.
 
 ## Escopo
 
@@ -170,3 +181,7 @@ make rpm
 fonte e os pacotes de entrada do fluxo akmod; o payload carregável específico
 do kernel é produzido quando o `akmods` executa o build para aquela versão. Os
 artefatos locais ficam em `dist/`.
+
+O alvo `install` de `module/Makefile` existe somente para desenvolvimento e não
+participa do mutex de lifecycle. Em produção, use exclusivamente os RPMs/akmods
+e o finalizador empacotado.

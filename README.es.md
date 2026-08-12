@@ -36,6 +36,8 @@ Este repositorio organiza ese soporte siguiendo el patrón de Fedora:
 - una cola duradera que finaliza cada kmod después de que termine la transacción
   RPM, validando propietario, `vermagic`, `depmod` y resolución antes de borrar
   cualquier override legado no gestionado;
+- un mutex global autenticado que serializa el mantenimiento de los índices de
+  módulos con otros drivers Galaxy Book, incluso durante un `dracut` paralelo;
 - un servicio de arranque que espera a `akmods`, carga explícitamente los dos
   módulos y crea los dispositivos I2C ausentes;
 - reintentos limitados mientras ACPI, I2C, los módulos y los amplificadores
@@ -119,7 +121,7 @@ Repita esta validación después de cada actualización del kernel. La prueba
 definitiva sigue siendo reproducir audio por los altavoces internos después de
 arrancar con el nuevo kernel.
 
-Desde la versión `1.00.10`, las integraciones que hayan terminado el build de
+Desde la versión `1.00.11`, las integraciones que hayan terminado el build de
 un kernel pueden esperar la finalización completa fuera de la transacción RPM:
 
 ```bash
@@ -131,6 +133,15 @@ El comando solo devuelve éxito después de validar los dos propietarios RPM y
 valores `vermagic` exactos, borrar únicamente overrides legados sin propietario,
 ejecutar `depmod` y confirmar la resolución exacta de ambos módulos. La cola
 automática usa el mismo contrato y conserva solicitudes interrumpidas.
+
+Antes del lock privado de MAX98390 y del lock compartido de RPM, el finalizador
+adquiere el mutex BSD exclusivo
+`/run/lock/galaxybook-kmod-lifecycle.lock`. Una integración coordinadora puede
+heredar el descriptor autenticado, que permanece válido hasta confirmar el
+marcador. Se revalidan los ancestros, propietario, modo `0600`, cantidad de
+hardlinks e identidad `device:inode` entre path y FD. La espera está limitada a
+diez minutos; un fallo de adquisición conserva la cola e impide que comiencen
+`depmod` o la limpieza.
 
 ## Alcance
 
@@ -171,3 +182,7 @@ make rpm
 fuente y los paquetes de entrada del flujo akmod; el payload cargable y
 específico del kernel se produce cuando `akmods` compila para esa versión. Los
 artefactos locales quedan en `dist/`.
+
+El objetivo `install` de `module/Makefile` existe solo para desarrollo y no
+participa en el mutex de lifecycle. En producción se deben usar exclusivamente
+los RPM/akmods y el finalizador empaquetado.
