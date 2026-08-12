@@ -2,7 +2,8 @@
 Description=Create I2C devices for MAX98390 HDA speaker amplifiers
 ConditionPathExistsGlob=/sys/bus/acpi/devices/M*X98390:*
 Wants=akmods.service
-After=akmods.service systemd-modules-load.service
+Requires=max98390-kmod-finalize.service
+After=akmods.service systemd-modules-load.service max98390-kmod-finalize.service
 Before=sound.target
 
 [Service]

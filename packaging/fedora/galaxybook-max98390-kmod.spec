@@ -31,6 +31,7 @@ service that creates the missing I2C devices for the speaker amplifiers.
 
 %package -n %{pkg_kmod_name}-common
 Summary:        Common files for the %{prjname} kernel module packaging
+Requires:       bash
 Requires:       binutils
 Requires:       coreutils
 Requires:       findutils
@@ -40,6 +41,8 @@ Requires:       i2c-tools
 Requires:       kmod
 Requires:       rpm
 Requires:       sed
+Requires:       systemd
+Requires:       util-linux-core
 Requires:       xz
 Requires:       zstd
 Recommends:     alsa-sof-firmware
@@ -70,12 +73,20 @@ install -m 0755 scripts/max98390-hda-i2c-setup.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 install -m 0755 scripts/max98390-hda-check-upstream.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
+install -m 0755 scripts/max98390-kmod-finalize.sh \
+  %{buildroot}%{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
 install -Dm0644 data/systemd/max98390-hda-i2c-setup.service \
   %{buildroot}%{_unitdir}/max98390-hda-i2c-setup.service
 install -Dm0644 data/systemd/max98390-hda-check-upstream.service \
   %{buildroot}%{_unitdir}/max98390-hda-check-upstream.service
+install -Dm0644 data/systemd/max98390-kmod-finalize.service \
+  %{buildroot}%{_unitdir}/max98390-kmod-finalize.service
+install -Dm0644 data/systemd/max98390-kmod-finalize.path \
+  %{buildroot}%{_unitdir}/max98390-kmod-finalize.path
 install -Dm0644 data/systemd-preset/80-galaxybook-max98390.preset \
   %{buildroot}%{_presetdir}/80-galaxybook-max98390.preset
+install -d -m0755 %{buildroot}%{_sharedstatedir}/galaxybook-max98390/pending
+install -d -m0755 %{buildroot}%{_sharedstatedir}/galaxybook-max98390/deferred
 
 for kernel_version in %{?kernel_versions}; do
   install -Dm0644 _kmod_build_${kernel_version%%___*}/snd-hda-scodec-max98390.ko \
@@ -87,95 +98,30 @@ done
 %{?akmod_install}
 
 %post -n %{pkg_kmod_name}-common
-%systemd_post max98390-hda-i2c-setup.service max98390-hda-check-upstream.service
+%systemd_post max98390-hda-i2c-setup.service max98390-hda-check-upstream.service max98390-kmod-finalize.path max98390-kmod-finalize.service
 
 %preun -n %{pkg_kmod_name}-common
-%systemd_preun max98390-hda-i2c-setup.service max98390-hda-check-upstream.service
+%systemd_preun max98390-hda-i2c-setup.service max98390-hda-check-upstream.service max98390-kmod-finalize.path max98390-kmod-finalize.service
 
 %postun -n %{pkg_kmod_name}-common
-%systemd_postun_with_restart max98390-hda-i2c-setup.service max98390-hda-check-upstream.service
+%systemd_postun_with_restart max98390-hda-i2c-setup.service max98390-hda-check-upstream.service max98390-kmod-finalize.path max98390-kmod-finalize.service
 
-%transfiletriggerin -n %{pkg_kmod_name}-common -- /lib/modules
-set -eu
-kernel_releases=""
-
-while IFS= read -r installed_path; do
-  case "$installed_path" in
-    /lib/modules/*/extra/galaxybook-max98390/*snd-hda-scodec-max98390*.ko*)
-      relative_path=${installed_path#/lib/modules/}
-      # RPM consumes each doubled percent sign while expanding the spec.
-      kernel_release=${relative_path%%%%/*}
-      kernel_releases="${kernel_releases}${kernel_release}\n"
-      ;;
-  esac
-done
-
-printf '%b' "$kernel_releases" | sort -u | while IFS= read -r kernel_release; do
-  [ -n "$kernel_release" ] || continue
-
-  expected_owner="kmod-galaxybook-max98390-${kernel_release}"
-  payload_root="/lib/modules/${kernel_release}/extra/galaxybook-max98390"
-
-  # Validate the complete replacement before touching an unmanaged legacy
-  # override. A partial kmod transaction must leave the working copy intact.
-  for module_name in snd-hda-scodec-max98390 snd-hda-scodec-max98390-i2c; do
-    payload_path=$(find "$payload_root" -type f \
-      \( -name "${module_name}.ko" -o -name "${module_name}.ko.xz" -o -name "${module_name}.ko.zst" \) \
-      -print -quit)
-    if [ -z "$payload_path" ]; then
-      echo "Missing packaged ${module_name} payload for ${kernel_release}" >&2
-      exit 1
-    fi
-
-    owner_nevra=$(rpm -qf "$payload_path")
-    case "$owner_nevra" in
-      ${expected_owner}-*) ;;
-      *)
-        echo "Unexpected owner for ${payload_path}: ${owner_nevra}" >&2
-        exit 1
-        ;;
-    esac
-
-    vermagic=$(modinfo -F vermagic "$payload_path")
-    case "$vermagic" in
-      "${kernel_release} "*) ;;
-      *)
-        echo "Invalid vermagic for ${payload_path}: ${vermagic}" >&2
-        exit 1
-        ;;
-    esac
-  done
-
-  for module_name in snd-hda-scodec-max98390 snd-hda-scodec-max98390-i2c; do
-    for extension in ko ko.xz ko.zst; do
-      legacy_path="/lib/modules/${kernel_release}/updates/sound/hda/codecs/side-codecs/${module_name}.${extension}"
-      if [ -e "$legacy_path" ] && ! rpm -qf "$legacy_path" >/dev/null 2>&1; then
-        rm -f -- "$legacy_path"
-      fi
-    done
-  done
-
-  depmod -a "$kernel_release"
-
-  for module_name in snd-hda-scodec-max98390 snd-hda-scodec-max98390-i2c; do
-    resolved_path=$(modinfo -k "$kernel_release" -n "$module_name")
-    case "$resolved_path" in
-      /lib/modules/${kernel_release}/extra/galaxybook-max98390/*) ;;
-      *)
-        echo "${module_name} resolved outside the packaged payload for ${kernel_release}: ${resolved_path}" >&2
-        exit 1
-        ;;
-    esac
-  done
-done
+%transfiletriggerin -n %{pkg_kmod_name}-common -p /usr/bin/bash -- /lib/modules /usr/lib/modules
+%{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh --from-rpm-trigger
 
 %files -n %{pkg_kmod_name}-common
 %{_datadir}/doc/%{pkg_kmod_name}/README.md
 %license %{_datadir}/licenses/%{name}/LICENSE
 %{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 %{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
+%{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
 %{_unitdir}/max98390-hda-i2c-setup.service
 %{_unitdir}/max98390-hda-check-upstream.service
+%{_unitdir}/max98390-kmod-finalize.path
+%{_unitdir}/max98390-kmod-finalize.service
 %{_presetdir}/80-galaxybook-max98390.preset
+%dir %{_sharedstatedir}/galaxybook-max98390
+%dir %{_sharedstatedir}/galaxybook-max98390/deferred
+%dir %{_sharedstatedir}/galaxybook-max98390/pending
 
 %changelog

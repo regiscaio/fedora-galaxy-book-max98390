@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for packaged MAX98390 modules awaiting finalization
+
+[Path]
+PathChanged=/var/lib/galaxybook-max98390/pending
+Unit=max98390-kmod-finalize.service
+
+[Install]
+WantedBy=paths.target

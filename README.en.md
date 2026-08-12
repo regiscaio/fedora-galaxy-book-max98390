@@ -32,6 +32,9 @@ missing part on those models is the `MAX98390` amplifier side.
 This repository organizes that support in the Fedora way:
 
 - external modules rebuilt and delivered per kernel with `akmods`;
+- a durable queue that finalizes each new kmod only after the RPM transaction
+  ends, validating owner, `vermagic`, `depmod`, and resolution before removing
+  any unmanaged legacy override;
 - a boot service that waits for `akmods`, explicitly loads both modules, and
   creates the missing I2C devices;
 - bounded retries while ACPI, I2C, the modules, and the amplifiers become
@@ -43,8 +46,10 @@ This repository organizes that support in the Fedora way:
 
 No `modules-load.d` file is installed. On the first boot into a new kernel,
 trying to load the modules before `akmods` finishes would create a race. The
-service therefore loads them only after their per-kernel build. The unit is
-automatically skipped on machines without a MAX98390 ACPI device.
+service therefore loads them only after their per-kernel build. The I2C unit is
+automatically skipped on machines without a MAX98390 ACPI device. The finalizer
+runs first and inhibits shutdown/sleep only during its short critical section;
+interrupted requests stay queued for a later try.
 
 The target topology is the Galaxy Book4 Ultra's: one ACPI-created client and
 three additional amplifiers at `0x39`, `0x3c`, and `0x3d`. The service only
@@ -88,6 +93,7 @@ modinfo -k "$kernel_release" snd-hda-scodec-max98390-i2c
 systemctl is-enabled max98390-hda-i2c-setup.service
 systemctl is-active max98390-hda-i2c-setup.service
 journalctl -b -u akmods.service -u max98390-hda-i2c-setup.service \
+  -u max98390-kmod-finalize.service \
   -u max98390-hda-check-upstream.service --no-pager
 
 find /sys/bus/i2c/devices -maxdepth 2 -type l -name driver \
@@ -108,6 +114,19 @@ problem and leaves the file outside RPM management.
 
 Repeat this validation after every kernel update. The definitive test remains
 playing audio through the internal speakers after booting the new kernel.
+
+Since version `1.00.09`, integrations that have completed a kernel build can
+wait for full finalization outside the RPM transaction with:
+
+```bash
+sudo /usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh \
+  --kernel "$kernel_release"
+```
+
+The command succeeds only after validating both exact RPM owners and
+`vermagic` values, removing only ownerless legacy overrides, running `depmod`,
+and confirming exact resolution of both modules. The automatic queue uses the
+same contract and retains interrupted requests for retry.
 
 ## Scope
 
@@ -133,7 +152,7 @@ line.
 
 - `module/`: sources for `snd-hda-scodec-max98390` and
   `snd-hda-scodec-max98390-i2c`
-- `scripts/`: boot helper and native-support check
+- `scripts/`: per-kernel finalizer, boot, and native-support helpers
 - `data/`: `systemd` units
 - `packaging/fedora/`: RPM/akmod spec and per-kernel payload generation
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=Finalize packaged MAX98390 modules outside the RPM transaction
+Wants=akmods.service systemd-logind.service
+Before=max98390-hda-i2c-setup.service
+After=local-fs.target akmods.service systemd-logind.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemd-inhibit --mode=block --what=shutdown:sleep:idle --who=GalaxyBook-MAX98390 --why=Finalizing-packaged-kernel-modules /usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh --pending
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=sound.target

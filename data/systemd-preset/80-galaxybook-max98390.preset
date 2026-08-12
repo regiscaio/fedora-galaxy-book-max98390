@@ -1,2 +1,4 @@
 enable max98390-hda-i2c-setup.service
 enable max98390-hda-check-upstream.service
+enable max98390-kmod-finalize.path
+enable max98390-kmod-finalize.service
