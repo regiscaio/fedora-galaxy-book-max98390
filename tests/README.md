@@ -51,4 +51,7 @@ MAX98390_RPM6_EPHEMERAL_TEST=1 ./tests/test_rpm6_locking.sh
 It builds and installs disposable fixture RPMs to prove on RPM 6 that a child
 `rpm -qf` remains warning-free under the shared OFD lock, a real RPM write is
 excluded for the complete critical section, and success, failure, and signal
-termination all release the lock.
+termination all release the lock. The signal case deliberately leaves a
+short-lived child holding the inherited OFD and waits for an exclusive-lock
+checkpoint before starting the next RPM transaction, avoiding a scheduler
+dependent false failure.

@@ -118,7 +118,7 @@ Repita essa validação após uma atualização de kernel. O teste definitivo
 continua sendo reproduzir áudio nos alto-falantes internos depois de reiniciar
 no novo kernel.
 
-Desde a versão `1.00.09`, integrações que já terminaram o build de um kernel
+Desde a versão `1.00.10`, integrações que já terminaram o build de um kernel
 podem aguardar a finalização completa, fora da transação RPM, com:
 
 ```bash

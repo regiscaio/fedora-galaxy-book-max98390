@@ -79,16 +79,95 @@ validate_kernel_name() {
     fi
 }
 
+validate_absolute_path() {
+    local path="$1"
+    local description="$2"
+
+    if [[ ! "$path" =~ ^/[A-Za-z0-9/._+-]+$ \
+        || "$path" == *'//'*
+        || "/${path#/}/" == *'/./'*
+        || "/${path#/}/" == *'/../'* ]]; then
+        error "$description path is unsafe: $path"
+        return 1
+    fi
+}
+
+validate_secure_directory_ancestry() {
+    local directory="$1"
+    local description="$2"
+    local current metadata owner_uid owner_gid mode
+
+    validate_absolute_path "$directory" "$description" || return 1
+    current="${directory%/}"
+    [[ -n "$current" ]] || current=/
+
+    while true; do
+        if [[ ! -d "$current" || -L "$current" ]]; then
+            error "$description ancestry is missing or unsafe: $current"
+            return 1
+        fi
+        metadata="$(stat -c '%u:%g:%a' -- "$current")" || return 1
+        IFS=: read -r owner_uid owner_gid mode <<< "$metadata"
+        if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            error "$description ancestry has an invalid mode: $current ($mode)"
+            return 1
+        fi
+
+        if [[ "${MAX98390_ALLOW_NON_ROOT:-0}" == 1 ]]; then
+            # Test-only overrides may live below a directory owned by the
+            # invoking account, while system ancestors remain root-owned.
+            if [[ "$owner_uid" != 0 && "$owner_uid" != "$EXPECTED_STATE_UID" ]]; then
+                error "$description ancestry has an unsafe owner: $current ($metadata)"
+                return 1
+            fi
+        elif [[ "$owner_uid:$owner_gid" != \
+            "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" ]]; then
+            error "$description ancestry has an unsafe owner: $current ($metadata)"
+            return 1
+        fi
+
+        if (( (8#$mode) & 8#022 )); then
+            # /tmp and /var/tmp are acceptable only to the explicitly enabled
+            # non-root test contract: their root-owned sticky directories
+            # protect the already-created random test root from replacement.
+            if [[ "${MAX98390_ALLOW_NON_ROOT:-0}" != 1 \
+                || ( "$current" != /tmp && "$current" != /var/tmp ) \
+                || "$owner_uid:$owner_gid:$mode" != 0:0:1777 ]]; then
+                error "$description ancestry is group- or world-writable: $current"
+                return 1
+            fi
+        fi
+
+        [[ "$current" == / ]] && break
+        current="${current%/*}"
+        [[ -n "$current" ]] || current=/
+    done
+}
+
 validate_state_directory() {
     local directory="$1"
-    local metadata
+    local metadata parent
 
+    validate_absolute_path "$directory" 'State directory' || return 1
+    parent="${directory%/*}"
+    [[ -n "$parent" ]] || parent=/
+    validate_secure_directory_ancestry "$parent" 'State directory' || return 1
     if [[ -L "$directory" || ( -e "$directory" && ! -d "$directory" ) ]]; then
         error "Refusing unsafe state directory: $directory"
         return 1
     fi
 
-    install -d -m 0755 -- "$directory"
+    if [[ ! -e "$directory" ]]; then
+        install -d -o "$EXPECTED_STATE_UID" -g "$EXPECTED_STATE_GID" \
+            -m 0755 -- "$directory"
+        # GNU install can preserve an inherited SGID bit on a new directory;
+        # apply the final mode explicitly after forcing the intended group.
+        chmod 00755 -- "$directory"
+    fi
+    if [[ ! -d "$directory" || -L "$directory" ]]; then
+        error "State directory changed while being secured: $directory"
+        return 1
+    fi
     metadata="$(stat -Lc '%u:%g:%a' -- "$directory")"
     if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:755" ]]; then
         error "State directory has unsafe ownership or mode: $directory ($metadata)"
@@ -97,9 +176,9 @@ validate_state_directory() {
 }
 
 ensure_state_directories() {
-    validate_state_directory "$STATE_ROOT"
-    validate_state_directory "$PENDING_DIR"
-    validate_state_directory "$DEFERRED_DIR"
+    validate_state_directory "$STATE_ROOT" || return 1
+    validate_state_directory "$PENDING_DIR" || return 1
+    validate_state_directory "$DEFERRED_DIR" || return 1
 }
 
 queue_kernel() {
@@ -151,8 +230,8 @@ validate_pending_marker() {
         return 1
     fi
 
-    metadata="$(stat -Lc '%u:%g:%a' -- "$marker")"
-    if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:644" ]]; then
+    metadata="$(stat -Lc '%u:%g:%a:%h' -- "$marker")"
+    if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:644:1" ]]; then
         error "Pending marker has unsafe ownership or mode: $marker ($metadata)"
         return 1
     fi
@@ -173,7 +252,9 @@ rpm_owner_state() {
         # Reassert the compatible OFD read lock before every RPM query. This is
         # idempotent on the same open-file-description and authenticates that
         # the full critical section is still serialized against RPM writers.
-        if ! "$FLOCK_COMMAND" --fcntl --shared --nonblock "$RPM_LOCK_FD"; then
+        if ! validate_open_rpm_lock \
+            || ! "$FLOCK_COMMAND" --fcntl --shared --nonblock "$RPM_LOCK_FD" \
+            || ! validate_open_rpm_lock; then
             return 2
         fi
     fi
@@ -277,74 +358,185 @@ marker_identity() {
     stat -Lc '%d:%i' -- "$marker"
 }
 
-validate_rpm_lock_path() {
-    if [[ ! "$RPM_LOCK_PATH" =~ ^/[A-Za-z0-9/._+-]+$ ]]; then
-        error "RPM transaction lock path is unsafe"
+legacy_metadata() {
+    local path="$1"
+    local metadata device inode owner_uid owner_gid mode links size
+
+    if [[ ! -f "$path" || -L "$path" ]]; then
+        error "Legacy override is not a regular non-symlink file: $path"
         return 1
     fi
+    metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' -- "$path")" || return 1
+    IFS=: read -r device inode owner_uid owner_gid mode links size <<< "$metadata"
+    [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ \
+        && "$size" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$owner_uid:$owner_gid" != \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" \
+        || ! "$mode" =~ ^[0-7]{3,4}$ \
+        || "$links" != 1 ]] \
+        || (( (8#$mode) & 8#022 )); then
+        error "Legacy override has unsafe metadata: $path ($metadata)"
+        return 1
+    fi
+    printf '%s\n' "$metadata"
 }
 
-acquire_rpm_read_lock() {
-    local metadata writable lock_parent path_identity fd_identity
-    local parent_parent current_component
+validate_rpm_lock_path() {
+    validate_absolute_path "$RPM_LOCK_PATH" 'RPM transaction lock'
+}
 
-    validate_rpm_lock_path || return 1
-    lock_parent="${RPM_LOCK_PATH%/*}"
-    if [[ ! -d "$lock_parent" || -L "$lock_parent" ]]; then
-        error "RPM transaction lock parent is unsafe: $lock_parent"
-        return 1
-    fi
-    parent_parent="${lock_parent%/*}"
-    current_component="${parent_parent}/${lock_parent##*/}"
-    if [[ ! -d "$parent_parent" || -L "$parent_parent" \
-        || ! -d "$current_component" || -L "$current_component" ]]; then
-        error "RPM transaction lock ancestry is unsafe"
-        return 1
-    fi
-    metadata="$(stat -Lc '%u:%g' -- "$lock_parent")"
-    if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" ]]; then
-        error "RPM transaction lock parent has unsafe ownership: $lock_parent ($metadata)"
-        return 1
-    fi
-    writable="$(find "$lock_parent" -maxdepth 0 -perm /022 -print -quit)"
-    if [[ -n "$writable" ]]; then
-        error "RPM transaction lock parent is writable by group or others: $lock_parent"
-        return 1
-    fi
+rpm_lock_metadata_is_safe() {
+    local metadata="$1"
+    local device inode owner_uid owner_gid mode links
+
+    IFS=: read -r device inode owner_uid owner_gid mode links <<< "$metadata"
+    [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ \
+        && "$owner_uid" =~ ^[0-9]+$ && "$owner_gid" =~ ^[0-9]+$ \
+        && "$mode" =~ ^[0-7]{3,4}$ && "$links" =~ ^[0-9]+$ ]] || return 1
+    [[ "$owner_uid:$owner_gid" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" ]] || return 1
+    (( ! ((8#$mode) & 8#022) )) || return 1
+    [[ "$links" == 1 ]]
+}
+
+validate_rpm_lock_file() {
+    local metadata
+
     if [[ ! -f "$RPM_LOCK_PATH" || -L "$RPM_LOCK_PATH" ]]; then
         error "RPM transaction lock is not a regular file: $RPM_LOCK_PATH"
         return 1
     fi
-    metadata="$(stat -Lc '%u:%g' -- "$RPM_LOCK_PATH")"
-    if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" ]]; then
-        error "RPM transaction lock has unsafe ownership: $RPM_LOCK_PATH ($metadata)"
+    metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$RPM_LOCK_PATH")" || return 1
+    if ! rpm_lock_metadata_is_safe "$metadata"; then
+        error "RPM transaction lock has unsafe metadata: $RPM_LOCK_PATH ($metadata)"
         return 1
     fi
-    writable="$(find "$RPM_LOCK_PATH" -maxdepth 0 -perm /022 -print -quit)"
-    if [[ -n "$writable" ]]; then
-        error "RPM transaction lock is writable by group or others: $RPM_LOCK_PATH"
-        return 1
-    fi
+}
 
-    path_identity="$(stat -Lc '%d:%i' -- "$RPM_LOCK_PATH")"
+validate_open_rpm_lock() {
+    local fd_path fd_metadata path_metadata
+
+    [[ "$RPM_LOCK_FD" =~ ^[0-9]+$ ]] || return 1
+    fd_path="/proc/${BASHPID}/fd/${RPM_LOCK_FD}"
+    if [[ ! -f "$fd_path" ]]; then
+        error "RPM transaction lock descriptor is not a regular file"
+        return 1
+    fi
+    validate_rpm_lock_file || return 1
+    fd_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path")" || return 1
+    path_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$RPM_LOCK_PATH")" || return 1
+    if [[ "$fd_metadata" != "$path_metadata" ]] \
+        || ! rpm_lock_metadata_is_safe "$fd_metadata"; then
+        error "Opened RPM lock no longer matches the safe validated path"
+        return 1
+    fi
+}
+
+close_rpm_read_lock() {
+    if [[ "$RPM_LOCK_FD" =~ ^[0-9]+$ ]]; then
+        exec {RPM_LOCK_FD}<&-
+    fi
+    RPM_LOCK_FD=""
+}
+
+acquire_rpm_read_lock() {
+    local lock_parent
+
+    validate_rpm_lock_path || return 1
+    lock_parent="${RPM_LOCK_PATH%/*}"
+    [[ -n "$lock_parent" ]] || lock_parent=/
+    validate_secure_directory_ancestry "$lock_parent" \
+        'RPM transaction lock' || return 1
+    validate_rpm_lock_file || return 1
     if ! exec {RPM_LOCK_FD}<"$RPM_LOCK_PATH"; then
         error "Could not open the RPM transaction lock"
         return 1
     fi
-    fd_identity="$(stat -Lc '%d:%i' -- "/proc/${BASHPID}/fd/${RPM_LOCK_FD}")"
-    if [[ "$fd_identity" != "$path_identity" ]]; then
-        error "Opened RPM lock does not match the validated path"
+    if ! validate_open_rpm_lock; then
+        close_rpm_read_lock
         return 1
     fi
     if ! "$FLOCK_COMMAND" --fcntl --shared \
         --timeout "$RPM_LOCK_TIMEOUT_SECONDS" "$RPM_LOCK_FD"; then
         error "Timed out waiting for the RPM transaction read lock"
+        close_rpm_read_lock
         return 1
     fi
-    fd_identity="$(stat -Lc '%d:%i' -- "/proc/${BASHPID}/fd/${RPM_LOCK_FD}")"
-    path_identity="$(stat -Lc '%d:%i' -- "$RPM_LOCK_PATH")"
-    if [[ "$fd_identity" != "$path_identity" ]]; then
-        error "RPM lock path changed while acquiring the read lock"
+    if ! validate_open_rpm_lock; then
+        close_rpm_read_lock
+        return 1
+    fi
+}
+
+private_lock_metadata_is_safe() {
+    local metadata="$1"
+    local device inode owner_uid owner_gid mode links
+
+    IFS=: read -r device inode owner_uid owner_gid mode links <<< "$metadata"
+    [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ \
+        && "$owner_uid" =~ ^[0-9]+$ && "$owner_gid" =~ ^[0-9]+$ \
+        && "$mode" =~ ^[0-7]{3,4}$ && "$links" =~ ^[0-9]+$ ]] || return 1
+    [[ "$owner_uid:$owner_gid:$mode:$links" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:600:1" ]]
+}
+
+validate_private_lock_file() {
+    local lock_file="$1"
+    local metadata
+
+    if [[ ! -f "$lock_file" || -L "$lock_file" ]]; then
+        error "Finalization lock is not a regular file: $lock_file"
+        return 1
+    fi
+    metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$lock_file")" || return 1
+    if ! private_lock_metadata_is_safe "$metadata"; then
+        error "Finalization lock has unsafe metadata: $lock_file ($metadata)"
+        return 1
+    fi
+}
+
+validate_open_private_lock() {
+    local lock_file="$1"
+    local lock_fd="$2"
+    local fd_path fd_metadata path_metadata
+
+    [[ "$lock_fd" =~ ^[0-9]+$ ]] || return 1
+    fd_path="/proc/${BASHPID}/fd/${lock_fd}"
+    [[ -f "$fd_path" ]] || return 1
+    validate_private_lock_file "$lock_file" || return 1
+    fd_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path")" || return 1
+    path_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$lock_file")" || return 1
+    if [[ "$fd_metadata" != "$path_metadata" ]] \
+        || ! private_lock_metadata_is_safe "$fd_metadata"; then
+        error "Opened finalization lock no longer matches the safe validated path"
+        return 1
+    fi
+}
+
+ensure_private_lock_directory() {
+    local metadata lock_parent
+
+    validate_absolute_path "$LOCK_ROOT" 'Private lock directory' || return 1
+    lock_parent="${LOCK_ROOT%/*}"
+    [[ -n "$lock_parent" ]] || lock_parent=/
+    validate_secure_directory_ancestry "$lock_parent" \
+        'Private lock directory' || return 1
+    if [[ -L "$LOCK_ROOT" || ( -e "$LOCK_ROOT" && ! -d "$LOCK_ROOT" ) ]]; then
+        error "Refusing unsafe lock directory: $LOCK_ROOT"
+        return 1
+    fi
+    if [[ ! -e "$LOCK_ROOT" ]]; then
+        install -d -o "$EXPECTED_STATE_UID" -g "$EXPECTED_STATE_GID" \
+            -m 0700 -- "$LOCK_ROOT"
+        chmod 00700 -- "$LOCK_ROOT"
+    fi
+    if [[ ! -d "$LOCK_ROOT" || -L "$LOCK_ROOT" ]]; then
+        error "Private lock directory changed while being secured: $LOCK_ROOT"
+        return 1
+    fi
+    metadata="$(stat -Lc '%u:%g:%a' -- "$LOCK_ROOT")" || return 1
+    if [[ "$metadata" != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:700" ]]; then
+        error "Private lock directory has unsafe ownership or mode: $LOCK_ROOT ($metadata)"
         return 1
     fi
 }
@@ -353,11 +545,13 @@ finalize_kernel() (
     local kernel="$1"
     local expected_owner expected_dir lock_file lock_fd module_name payload
     local legacy_path extension state resolved_path marker identity current_identity
+    local lock_existed=0
     local -a modules=("$CORE_MODULE" "$I2C_MODULE")
     local -a legacy_to_remove=()
     local -a markers=()
     declare -A payloads=()
     declare -A marker_identities=()
+    declare -A legacy_identities=()
 
     validate_kernel_name "$kernel" || return 1
     if [[ ! -d "${MODULE_ROOT}/${kernel}" ]]; then
@@ -365,38 +559,36 @@ finalize_kernel() (
         return 1
     fi
 
-    if [[ ! -d "${LOCK_ROOT%/*}" || -L "${LOCK_ROOT%/*}" ]]; then
-        error "Private lock parent is unavailable or unsafe: ${LOCK_ROOT%/*}"
-        return 1
-    fi
-    if [[ -L "$LOCK_ROOT" || ( -e "$LOCK_ROOT" && ! -d "$LOCK_ROOT" ) ]]; then
-        error "Refusing unsafe lock directory: $LOCK_ROOT"
-        return 1
-    fi
-    install -d -m 0700 -- "$LOCK_ROOT"
-    if [[ "$(stat -Lc '%u:%g:%a' -- "$LOCK_ROOT")" \
-        != "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:700" ]]; then
-        error "Private lock directory has unsafe ownership or mode: $LOCK_ROOT"
-        return 1
-    fi
+    # The public --kernel API bypasses process_pending(), so authenticate the
+    # durable state roots here before reading or acknowledging any marker.
+    ensure_state_directories || return 1
+    ensure_private_lock_directory || return 1
     lock_file="${LOCK_ROOT}/galaxybook-max98390-${kernel}.lock"
     if [[ -L "$lock_file" || ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
         error "Refusing unsafe finalization lock: $lock_file"
         return 1
     fi
+    if [[ -e "$lock_file" ]]; then
+        lock_existed=1
+        validate_private_lock_file "$lock_file" || return 1
+    fi
+    umask 077
     if ! exec {lock_fd}>>"$lock_file"; then
         error "Could not open finalization lock for $kernel"
         return 1
     fi
-    if ! chown "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" -- "$lock_file" \
-        || ! chmod 0600 -- "$lock_file"; then
+    if (( lock_existed == 0 )) \
+        && { ! chown "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}" -- "$lock_file" \
+            || ! chmod 0600 -- "$lock_file"; }; then
         error "Could not secure finalization lock for $kernel"
         return 1
     fi
+    validate_open_private_lock "$lock_file" "$lock_fd" || return 1
     if ! "$FLOCK_COMMAND" -x "$lock_fd"; then
         error "Could not acquire finalization lock for $kernel"
         return 1
     fi
+    validate_open_private_lock "$lock_file" "$lock_fd" || return 1
     acquire_rpm_read_lock || return 1
 
     for marker in \
@@ -431,6 +623,8 @@ finalize_kernel() (
             legacy_path="${MODULE_ROOT}/${kernel}/updates/sound/hda/codecs/side-codecs/${module_name}.${extension}"
             [[ -e "$legacy_path" || -L "$legacy_path" ]] || continue
 
+            identity="$(legacy_metadata "$legacy_path")" || return 1
+
             if rpm_owner_state "$legacy_path"; then
                 log "Preserving RPM-owned legacy path $legacy_path ($RPM_OWNER)"
                 continue
@@ -440,6 +634,7 @@ finalize_kernel() (
 
             if (( state == 1 )); then
                 legacy_to_remove+=("$legacy_path")
+                legacy_identities["$legacy_path"]="$identity"
             else
                 error "Could not safely determine RPM ownership of $legacy_path"
                 return 1
@@ -448,8 +643,17 @@ finalize_kernel() (
     done
 
     for legacy_path in "${legacy_to_remove[@]}"; do
+        identity="$(legacy_metadata "$legacy_path")" || return 1
+        if [[ "$identity" != "${legacy_identities[$legacy_path]}" ]]; then
+            error "Legacy override changed after ownership validation: $legacy_path"
+            return 1
+        fi
         log "Removing unmanaged legacy override $legacy_path"
         rm -f -- "$legacy_path"
+        if [[ -e "$legacy_path" || -L "$legacy_path" ]]; then
+            error "Legacy override remained after removal: $legacy_path"
+            return 1
+        fi
     done
 
     if ! "$DEPMOD_COMMAND" -a "$kernel"; then

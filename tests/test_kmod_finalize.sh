@@ -45,12 +45,19 @@ FAKE_DEPMOD_CALLS="$TEST_ROOT/depmod-calls"
 FAKE_SLEEP_CALLS="$TEST_ROOT/sleep-calls"
 FAKE_SYSTEMCTL_CALLS="$TEST_ROOT/systemctl-calls"
 FAKE_RUNNING_KERNEL="test-running.x86_64"
+FAKE_LEGACY_SWAP_SOURCE=""
+FAKE_LEGACY_SWAP_TRIGGER=""
+FAKE_LEGACY_SWAP_REPLACEMENT=""
 
 fake_rpm() {
     local path="${*: -1}"
     local remaining=0
 
     printf '%s\n' "$path" >> "$FAKE_RPM_CALLS"
+    if [[ -n "$FAKE_LEGACY_SWAP_TRIGGER" \
+        && "$path" == "$FAKE_LEGACY_SWAP_TRIGGER" ]]; then
+        mv -fT -- "$FAKE_LEGACY_SWAP_REPLACEMENT" "$FAKE_LEGACY_SWAP_SOURCE"
+    fi
     if [[ -f "$FAKE_BLOCK_REQUEST" && ! -f "$FAKE_BLOCK_RELEASE" ]]; then
         : > "$FAKE_BLOCK_ENTERED"
         while [[ ! -f "$FAKE_BLOCK_RELEASE" ]]; do
@@ -170,6 +177,22 @@ assert_missing() {
     }
 }
 
+alternate_group_id() {
+    local candidate
+
+    while IFS= read -r candidate; do
+        if [[ "$candidate" != "$EXPECTED_STATE_GID" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(id -G | tr ' ' '\n')
+    if [[ "$EUID" -eq 0 ]]; then
+        printf '%s\n' 1
+        return 0
+    fi
+    printf '%s\n' "$EXPECTED_STATE_GID"
+}
+
 test_finalizer_validates_then_removes_unmanaged_legacy() {
     local kernel=7.1.8-success.x86_64 legacy
 
@@ -222,6 +245,60 @@ test_rpm_owned_legacy_is_preserved() {
     [[ -f "$legacy" ]]
 }
 
+test_legacy_cleanup_rejects_symlink_and_hardlink() {
+    local symlink_kernel=7.1.8-legacy-symlink.x86_64
+    local hardlink_kernel=7.1.8-legacy-hardlink.x86_64
+    local symlink_path hardlink_path alias target
+
+    new_kernel_fixture "$symlink_kernel"
+    symlink_path="$(legacy_path "$symlink_kernel" "$CORE_MODULE")"
+    target="$TEST_ROOT/legacy-target"
+    : > "$target"
+    rm -f -- "$symlink_path"
+    ln -s "$target" "$symlink_path"
+    if finalize_kernel "$symlink_kernel" >/dev/null 2>&1; then
+        printf 'symlink legacy override was accepted for cleanup\n' >&2
+        return 1
+    fi
+    [[ -L "$symlink_path" && -f "$target" ]]
+
+    new_kernel_fixture "$hardlink_kernel"
+    hardlink_path="$(legacy_path "$hardlink_kernel" "$CORE_MODULE")"
+    alias="${hardlink_path}.alias"
+    ln "$hardlink_path" "$alias"
+    if finalize_kernel "$hardlink_kernel" >/dev/null 2>&1; then
+        printf 'hard-linked legacy override was accepted for cleanup\n' >&2
+        return 1
+    fi
+    [[ -f "$hardlink_path" && -f "$alias" ]]
+}
+
+test_legacy_cleanup_rejects_identity_swap_before_unlink() {
+    local kernel=7.1.8-legacy-swap.x86_64
+    local source trigger replacement
+
+    new_kernel_fixture "$kernel"
+    source="$(legacy_path "$kernel" "$CORE_MODULE")"
+    trigger="$(legacy_path "$kernel" "$I2C_MODULE")"
+    replacement="$TEST_ROOT/legacy-replacement"
+    printf '%s\n' replacement-must-survive > "$replacement"
+    chmod 0644 "$replacement"
+    FAKE_LEGACY_SWAP_SOURCE="$source"
+    FAKE_LEGACY_SWAP_TRIGGER="$trigger"
+    FAKE_LEGACY_SWAP_REPLACEMENT="$replacement"
+
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'legacy identity swap before unlink was accepted\n' >&2
+        return 1
+    fi
+    [[ "$(< "$source")" == replacement-must-survive ]]
+    [[ -f "$trigger" ]]
+
+    FAKE_LEGACY_SWAP_SOURCE=""
+    FAKE_LEGACY_SWAP_TRIGGER=""
+    FAKE_LEGACY_SWAP_REPLACEMENT=""
+}
+
 test_trigger_only_queues_exact_paths_without_rpm_query() {
     local kernel=7.1.8-trigger.x86_64 nested=7.1.8-nested.x86_64
     local calls_before calls_after
@@ -241,6 +318,20 @@ EOF
     assert_missing "${PENDING_DIR}/${nested}.pending"
     grep -Fxq -- "start --no-block $FINALIZER_PATH_UNIT $FINALIZER_UNIT" "$FAKE_SYSTEMCTL_CALLS"
     rm -f -- "${PENDING_DIR}/${kernel}.pending"
+}
+
+test_pending_marker_rejects_hardlinks() {
+    local kernel=7.1.8-marker-hardlink.x86_64 marker alias
+
+    queue_kernel "$kernel" >/dev/null
+    marker="${PENDING_DIR}/${kernel}.pending"
+    alias="${PENDING_DIR}/${kernel}.alias"
+    ln "$marker" "$alias"
+    if validate_pending_marker "$kernel" "$marker" >/dev/null 2>&1; then
+        printf 'hard-linked pending marker was accepted\n' >&2
+        return 1
+    fi
+    rm -f -- "$alias" "$marker"
 }
 
 test_lock_warning_is_retried_and_never_emitted() {
@@ -358,6 +449,154 @@ test_running_failure_stays_pending_without_directory_churn() {
     assert_missing "${DEFERRED_DIR}/${kernel}.pending"
 }
 
+test_state_and_private_lock_creation_override_sgid_group() {
+    local original_state_root="$STATE_ROOT"
+    local original_pending_dir="$PENDING_DIR"
+    local original_deferred_dir="$DEFERRED_DIR"
+    local original_lock_root="$LOCK_ROOT"
+    local parent="$TEST_ROOT/sgid-parent"
+    local inherited_gid
+
+    inherited_gid="$(alternate_group_id)"
+    mkdir -p "$parent"
+    chgrp "$inherited_gid" "$parent"
+    chmod 2755 "$parent"
+
+    STATE_ROOT="$parent/state"
+    PENDING_DIR="$STATE_ROOT/pending"
+    DEFERRED_DIR="$STATE_ROOT/deferred"
+    LOCK_ROOT="$parent/private-lock"
+    ensure_state_directories
+    ensure_private_lock_directory
+
+    [[ "$(stat -Lc '%u:%g:%a' -- "$STATE_ROOT")" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:755" ]]
+    [[ "$(stat -Lc '%u:%g:%a' -- "$PENDING_DIR")" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:755" ]]
+    [[ "$(stat -Lc '%u:%g:%a' -- "$DEFERRED_DIR")" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:755" ]]
+    [[ "$(stat -Lc '%u:%g:%a' -- "$LOCK_ROOT")" == \
+        "${EXPECTED_STATE_UID}:${EXPECTED_STATE_GID}:700" ]]
+
+    STATE_ROOT="$original_state_root"
+    PENDING_DIR="$original_pending_dir"
+    DEFERRED_DIR="$original_deferred_dir"
+    LOCK_ROOT="$original_lock_root"
+}
+
+test_state_and_private_lock_reject_writable_ancestry() {
+    local original_state_root="$STATE_ROOT"
+    local original_pending_dir="$PENDING_DIR"
+    local original_deferred_dir="$DEFERRED_DIR"
+    local original_lock_root="$LOCK_ROOT"
+    local unsafe_parent="$TEST_ROOT/writable-parent"
+
+    mkdir -p "$unsafe_parent"
+    chmod 0777 "$unsafe_parent"
+    STATE_ROOT="$unsafe_parent/state"
+    PENDING_DIR="$STATE_ROOT/pending"
+    DEFERRED_DIR="$STATE_ROOT/deferred"
+    LOCK_ROOT="$unsafe_parent/private-lock"
+
+    if ensure_state_directories >/dev/null 2>&1; then
+        printf 'state directory accepted writable ancestry\n' >&2
+        return 1
+    fi
+    if ensure_private_lock_directory >/dev/null 2>&1; then
+        printf 'private lock accepted writable ancestry\n' >&2
+        return 1
+    fi
+    assert_missing "$STATE_ROOT"
+    assert_missing "$LOCK_ROOT"
+
+    STATE_ROOT="$original_state_root"
+    PENDING_DIR="$original_pending_dir"
+    DEFERRED_DIR="$original_deferred_dir"
+    LOCK_ROOT="$original_lock_root"
+}
+
+test_public_kernel_rejects_unsafe_state_without_side_effects() {
+    local kernel=7.1.8-public-state.x86_64
+    local original_state_root="$STATE_ROOT"
+    local original_pending_dir="$PENDING_DIR"
+    local original_deferred_dir="$DEFERRED_DIR"
+    local original_modinfo_command="$MODINFO_COMMAND"
+    local unsafe_parent="$TEST_ROOT/public-writable-parent"
+    local safe_state="$TEST_ROOT/public-safe-state"
+    local linked_state="$TEST_ROOT/public-linked-state"
+    local legacy rpm_before depmod_before
+    local modinfo_calls="$TEST_ROOT/public-state-modinfo-calls"
+
+    new_kernel_fixture "$kernel"
+    legacy="$(legacy_path "$kernel" "$CORE_MODULE")"
+    : > "$modinfo_calls"
+    counting_modinfo() {
+        printf '%s\n' "$*" >> "$modinfo_calls"
+        fake_modinfo "$@"
+    }
+    MODINFO_COMMAND=counting_modinfo
+    mkdir -p "$unsafe_parent" "$safe_state/pending" "$safe_state/deferred"
+    chmod 0777 "$unsafe_parent"
+    ln -s "$safe_state" "$linked_state"
+
+    rpm_before="$(wc -l < "$FAKE_RPM_CALLS")"
+    depmod_before="$(wc -l < "$FAKE_DEPMOD_CALLS")"
+    STATE_ROOT="$linked_state"
+    PENDING_DIR="$STATE_ROOT/pending"
+    DEFERRED_DIR="$STATE_ROOT/deferred"
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'public --kernel accepted a symlink state root\n' >&2
+        return 1
+    fi
+    [[ "$(wc -l < "$FAKE_RPM_CALLS")" == "$rpm_before" ]]
+    [[ "$(wc -l < "$FAKE_DEPMOD_CALLS")" == "$depmod_before" ]]
+    [[ ! -s "$modinfo_calls" ]]
+    [[ -f "$legacy" ]]
+
+    STATE_ROOT="$unsafe_parent/state"
+    PENDING_DIR="$STATE_ROOT/pending"
+    DEFERRED_DIR="$STATE_ROOT/deferred"
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'public --kernel accepted writable state ancestry\n' >&2
+        return 1
+    fi
+    [[ "$(wc -l < "$FAKE_RPM_CALLS")" == "$rpm_before" ]]
+    [[ "$(wc -l < "$FAKE_DEPMOD_CALLS")" == "$depmod_before" ]]
+    [[ ! -s "$modinfo_calls" ]]
+    [[ -f "$legacy" ]]
+
+    STATE_ROOT="$safe_state"
+    PENDING_DIR="$STATE_ROOT/pending"
+    DEFERRED_DIR="$STATE_ROOT/deferred"
+    chmod 0777 "$PENDING_DIR"
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'public --kernel accepted writable pending directory\n' >&2
+        return 1
+    fi
+    [[ "$(wc -l < "$FAKE_RPM_CALLS")" == "$rpm_before" ]]
+    [[ "$(wc -l < "$FAKE_DEPMOD_CALLS")" == "$depmod_before" ]]
+    [[ ! -s "$modinfo_calls" ]]
+    [[ -f "$legacy" ]]
+
+    chmod 0755 "$PENDING_DIR"
+    chgrp "$(alternate_group_id)" "$DEFERRED_DIR"
+    if [[ "$(stat -Lc %g "$DEFERRED_DIR")" != "$EXPECTED_STATE_GID" ]]; then
+        if finalize_kernel "$kernel" >/dev/null 2>&1; then
+            printf 'public --kernel accepted wrong-group deferred directory\n' >&2
+            return 1
+        fi
+        [[ "$(wc -l < "$FAKE_RPM_CALLS")" == "$rpm_before" ]]
+        [[ "$(wc -l < "$FAKE_DEPMOD_CALLS")" == "$depmod_before" ]]
+        [[ ! -s "$modinfo_calls" ]]
+        [[ -f "$legacy" ]]
+    fi
+
+    STATE_ROOT="$original_state_root"
+    PENDING_DIR="$original_pending_dir"
+    DEFERRED_DIR="$original_deferred_dir"
+    MODINFO_COMMAND="$original_modinfo_command"
+}
+
 test_private_lock_rejects_symlink_and_wrong_owner_contract() {
     local kernel=7.1.8-lock-safety.x86_64 original_uid unsafe_root
 
@@ -380,6 +619,68 @@ test_private_lock_rejects_symlink_and_wrong_owner_contract() {
     fi
     EXPECTED_STATE_UID="$original_uid"
     LOCK_ROOT="$TEST_ROOT/locks/private"
+}
+
+test_private_lock_revalidates_group_mode_and_link_count_after_open() {
+    local group_kernel=7.1.8-private-group.x86_64
+    local hardlink_kernel=7.1.8-private-hardlink.x86_64
+    local mutation_kernel=7.1.8-private-mutation.x86_64
+    local original_lock_root="$LOCK_ROOT"
+    local original_flock_command="$FLOCK_COMMAND"
+    local group_root="$TEST_ROOT/locks/group-private"
+    local hardlink_root="$TEST_ROOT/locks/hardlink-private"
+    local mutation_root="$TEST_ROOT/locks/mutation-private"
+    local group_file hardlink_file mutation_file backing_file alternate_gid
+
+    alternate_gid="$(alternate_group_id)"
+    if [[ "$alternate_gid" != "$EXPECTED_STATE_GID" ]]; then
+        new_kernel_fixture "$group_kernel"
+        LOCK_ROOT="$group_root"
+        ensure_private_lock_directory
+        group_file="$LOCK_ROOT/galaxybook-max98390-${group_kernel}.lock"
+        : > "$group_file"
+        chmod 0600 "$group_file"
+        chgrp "$alternate_gid" "$group_file"
+        if finalize_kernel "$group_kernel" >/dev/null 2>&1; then
+            printf 'private lock with an unexpected group was accepted\n' >&2
+            return 1
+        fi
+    fi
+
+    new_kernel_fixture "$hardlink_kernel"
+    LOCK_ROOT="$hardlink_root"
+    ensure_private_lock_directory
+    hardlink_file="$LOCK_ROOT/galaxybook-max98390-${hardlink_kernel}.lock"
+    backing_file="$LOCK_ROOT/backing.lock"
+    : > "$backing_file"
+    chmod 0600 "$backing_file"
+    ln "$backing_file" "$hardlink_file"
+    if finalize_kernel "$hardlink_kernel" >/dev/null 2>&1; then
+        printf 'hard-linked private lock was accepted\n' >&2
+        return 1
+    fi
+
+    new_kernel_fixture "$mutation_kernel"
+    LOCK_ROOT="$mutation_root"
+    mutation_file="$LOCK_ROOT/galaxybook-max98390-${mutation_kernel}.lock"
+    mutating_private_flock() {
+        local status
+
+        /usr/bin/flock "$@"
+        status=$?
+        if (( status == 0 )) && [[ "$1" == -x ]]; then
+            chmod 0666 "$mutation_file"
+        fi
+        return "$status"
+    }
+    FLOCK_COMMAND=mutating_private_flock
+    if finalize_kernel "$mutation_kernel" >/dev/null 2>&1; then
+        printf 'private lock mode mutation after flock was accepted\n' >&2
+        return 1
+    fi
+
+    FLOCK_COMMAND="$original_flock_command"
+    LOCK_ROOT="$original_lock_root"
 }
 
 test_rpm_lock_rejects_symlink_and_wrong_owner_contract() {
@@ -408,16 +709,68 @@ test_rpm_lock_rejects_symlink_and_wrong_owner_contract() {
     EXPECTED_STATE_UID="$original_uid"
 }
 
+test_rpm_lock_revalidates_group_mode_and_link_count() {
+    local kernel=7.1.8-rpm-metadata.x86_64
+    local original_flock_command="$FLOCK_COMMAND"
+    local alternate_gid alias
+
+    new_kernel_fixture "$kernel"
+    alternate_gid="$(alternate_group_id)"
+    if [[ "$alternate_gid" != "$EXPECTED_STATE_GID" ]]; then
+        chgrp "$alternate_gid" "$RPM_LOCK_PATH"
+        if finalize_kernel "$kernel" >/dev/null 2>&1; then
+            printf 'RPM lock with an unexpected group was accepted\n' >&2
+            return 1
+        fi
+        chgrp "$EXPECTED_STATE_GID" "$RPM_LOCK_PATH"
+    fi
+
+    alias="$TEST_ROOT/rpm.lock.alias"
+    ln "$RPM_LOCK_PATH" "$alias"
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'hard-linked RPM lock was accepted\n' >&2
+        return 1
+    fi
+    rm -f -- "$alias"
+
+    mutating_rpm_flock() {
+        local status
+
+        /usr/bin/flock "$@"
+        status=$?
+        if (( status == 0 )) && [[ " $* " == *' --fcntl --shared '* \
+            && " $* " != *' --nonblock '* ]]; then
+            chmod 0666 "$RPM_LOCK_PATH"
+        fi
+        return "$status"
+    }
+    FLOCK_COMMAND=mutating_rpm_flock
+    if finalize_kernel "$kernel" >/dev/null 2>&1; then
+        printf 'RPM lock mode mutation after OFD acquisition was accepted\n' >&2
+        return 1
+    fi
+    chmod 0644 "$RPM_LOCK_PATH"
+    FLOCK_COMMAND="$original_flock_command"
+}
+
 test_finalizer_validates_then_removes_unmanaged_legacy
 test_owner_or_vermagic_failure_preserves_legacy
 test_rpm_owned_legacy_is_preserved
+test_legacy_cleanup_rejects_symlink_and_hardlink
+test_legacy_cleanup_rejects_identity_swap_before_unlink
 test_trigger_only_queues_exact_paths_without_rpm_query
+test_pending_marker_rejects_hardlinks
 test_lock_warning_is_retried_and_never_emitted
 test_enqueue_during_worker_remains_pending_then_converges
 test_finalizer_waits_for_active_rpm_writer
 test_nonrunning_failure_defers_once_and_running_boot_retries
 test_running_failure_stays_pending_without_directory_churn
+test_state_and_private_lock_creation_override_sgid_group
+test_state_and_private_lock_reject_writable_ancestry
+test_public_kernel_rejects_unsafe_state_without_side_effects
 test_private_lock_rejects_symlink_and_wrong_owner_contract
+test_private_lock_revalidates_group_mode_and_link_count_after_open
 test_rpm_lock_rejects_symlink_and_wrong_owner_contract
+test_rpm_lock_revalidates_group_mode_and_link_count
 
 printf 'test_kmod_finalize: ok\n'

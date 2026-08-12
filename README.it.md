@@ -118,7 +118,7 @@ Ripetere questa convalida dopo ogni aggiornamento del kernel. La prova definitiv
 rimane la riproduzione di audio tramite gli altoparlanti interni dopo l'avvio
 con il nuovo kernel.
 
-Dalla versione `1.00.09`, le integrazioni che hanno completato la build di un
+Dalla versione `1.00.10`, le integrazioni che hanno completato la build di un
 kernel possono attendere la finalizzazione completa fuori dalla transazione RPM:
 
 ```bash

@@ -71,16 +71,24 @@ run_release_case() {
     local mode="$1"
     local ready="$test_root/${mode}.ready"
     local release="$test_root/${mode}.release"
-    local holder_pid attempt holder_status=0 blocked
+    local holder_pid attempt holder_status=0 blocked drain_fd
 
     (
         local holder_fd
         exec {holder_fd}<"$lock_path"
         flock --fcntl --shared "$holder_fd"
         : > "$ready"
-        while [[ ! -f "$release" ]]; do
-            /usr/bin/sleep 0.01
-        done
+        if [[ "$mode" == signal ]]; then
+            # This child inherits the OFD and deliberately outlives a TERM
+            # sent only to its parent shell. A real systemd stop targets the
+            # whole control group; this synthetic edge proves the standalone
+            # lifecycle without relying on scheduler timing.
+            /usr/bin/bash -c 'trap "" TERM HUP; /usr/bin/sleep 0.25'
+        else
+            while [[ ! -f "$release" ]]; do
+                /usr/bin/sleep 0.01
+            done
+        fi
         [[ "$mode" == failure ]] && exit 73
         exit 0
     ) &
@@ -113,8 +121,13 @@ run_release_case() {
         signal) (( holder_status > 128 )) ;;
     esac
 
-    # A successful transaction immediately after process termination proves
-    # the open-file-description was released on success, failure, and signal.
+    # A shell can exit from SIGTERM while a short-lived child still owns the
+    # inherited open-file-description. Wait for an exclusive OFD checkpoint
+    # before the next transaction so signal release is deterministic rather
+    # than dependent on scheduler timing.
+    exec {drain_fd}<>"$lock_path"
+    flock --fcntl --exclusive --timeout 2 "$drain_fd"
+    exec {drain_fd}>&-
     rpm --nodeps --replacepkgs -i "$writer_rpm"
 }
 

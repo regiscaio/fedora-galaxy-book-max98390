@@ -93,6 +93,8 @@ test_finalizer_is_ordered_and_transaction_safe() {
     assert_file_contains_fixed "$FINALIZER_SERVICE" \
         'ExecStart=/usr/bin/systemd-inhibit --mode=block --what=shutdown:sleep:idle' \
         'finalizer work is not protected by a shutdown/sleep inhibitor'
+    assert_file_contains_fixed "$FINALIZER_SERVICE" 'KillMode=control-group' \
+        'finalizer does not terminate the complete OFD-holding process tree'
     assert_file_contains_fixed "$FINALIZER_SERVICE" 'TimeoutStartSec=20min' \
         'finalizer timeout is too short for multiple per-kernel RPM lock waits'
     assert_file_contains_fixed "$SETUP_SERVICE" 'Requires=max98390-kmod-finalize.service' \

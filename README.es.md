@@ -119,7 +119,7 @@ Repita esta validación después de cada actualización del kernel. La prueba
 definitiva sigue siendo reproducir audio por los altavoces internos después de
 arrancar con el nuevo kernel.
 
-Desde la versión `1.00.09`, las integraciones que hayan terminado el build de
+Desde la versión `1.00.10`, las integraciones que hayan terminado el build de
 un kernel pueden esperar la finalización completa fuera de la transacción RPM:
 
 ```bash

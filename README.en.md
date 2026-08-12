@@ -115,7 +115,7 @@ problem and leaves the file outside RPM management.
 Repeat this validation after every kernel update. The definitive test remains
 playing audio through the internal speakers after booting the new kernel.
 
-Since version `1.00.09`, integrations that have completed a kernel build can
+Since version `1.00.10`, integrations that have completed a kernel build can
 wait for full finalization outside the RPM transaction with:
 
 ```bash
