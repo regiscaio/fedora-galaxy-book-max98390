@@ -1,0 +1,2 @@
+enable max98390-hda-i2c-setup.service
+enable max98390-hda-check-upstream.service

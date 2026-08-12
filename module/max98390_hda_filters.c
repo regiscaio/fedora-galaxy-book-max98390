@@ -10,11 +10,25 @@
 #include "max98390_hda_filters.h"
 #include "max98390_regs.h"
 
-void max98390_configure_filters(struct max98390_hda_priv *priv)
+static int max98390_write_checked(struct max98390_hda_priv *priv,
+				  unsigned int reg, unsigned int value)
+{
+	int ret;
+
+	ret = regmap_write(priv->regmap, reg, value);
+	if (ret < 0)
+		dev_err(priv->dev, "Failed to write register 0x%04x: %d\n",
+			reg, ret);
+
+	return ret;
+}
+
+int max98390_configure_filters(struct max98390_hda_priv *priv)
 {
 	unsigned int i2c_addr = priv->i2c_addr;
 	bool is_tweeter = false;
 	int pcm_channel = 0;
+	int ret;
 
 	/* Identify speaker based on I2C address */
 	/* Configure PCM input channel for stereo separation */
@@ -42,10 +56,12 @@ void max98390_configure_filters(struct max98390_hda_priv *priv)
 	}
 
 	/* Configure PCM input channel for stereo separation */
-	regmap_write(priv->regmap, 0x2021, pcm_channel);
+	ret = max98390_write_checked(priv, MAX98390_PCM_CH_SRC_1, pcm_channel);
+	if (ret < 0)
+		return ret;
 
 	/* Load appropriate DSM firmware */
-	max98390_configure_high_pass_filter(priv, 3000, is_tweeter);
+	return max98390_configure_high_pass_filter(priv, 3000, is_tweeter);
 }
 
 /* Complete DSM firmware blobs from Google Redrix */
@@ -173,41 +189,74 @@ static const u8 max98390_dsm_firmware_tweeter[] = {
 };
 
 /* Load complete DSM firmware blob */
-static void max98390_load_dsm_firmware(struct max98390_hda_priv *priv, bool is_tweeter)
+static int max98390_load_dsm_firmware(struct max98390_hda_priv *priv,
+				      bool is_tweeter)
 {
 	const u8 *firmware;
-	int i;
+	size_t firmware_size;
+	size_t i;
+	int ret;
 
-	if (is_tweeter)
+	if (is_tweeter) {
 		firmware = max98390_dsm_firmware_tweeter;
-	else
+		firmware_size = ARRAY_SIZE(max98390_dsm_firmware_tweeter);
+	} else {
 		firmware = max98390_dsm_firmware_woofer;
+		firmware_size = ARRAY_SIZE(max98390_dsm_firmware_woofer);
+	}
+
+	if (firmware_size != MAX98390_DSM_PARAM_SIZE) {
+		dev_err(priv->dev, "Invalid DSM firmware size: %zu (expected %u)\n",
+			firmware_size, MAX98390_DSM_PARAM_SIZE);
+		return -EINVAL;
+	}
 
 	/* Write all 913 bytes sequentially starting from 0x2050 */
-	for (i = 0; i < MAX98390_DSM_PARAM_SIZE; i++)
-		regmap_write(priv->regmap, MAX98390_DSM_START_ADDR + i, firmware[i]);
+	for (i = 0; i < firmware_size; i++) {
+		ret = max98390_write_checked(priv,
+					     MAX98390_DSM_START_ADDR + i,
+					     firmware[i]);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
 }
 
 /* Configure DSM with appropriate firmware based on speaker type */
-void max98390_configure_high_pass_filter(struct max98390_hda_priv *priv, int cutoff_freq, bool is_tweeter)
+int max98390_configure_high_pass_filter(struct max98390_hda_priv *priv,
+					int cutoff_freq, bool is_tweeter)
 {
+	int ret;
+
+	/* The firmware blob already contains the fixed cutoff coefficients. */
+	(void)cutoff_freq;
+
 	/* Load complete DSM firmware (913 bytes, all registers) */
-	max98390_load_dsm_firmware(priv, is_tweeter);
+	ret = max98390_load_dsm_firmware(priv, is_tweeter);
+	if (ret < 0)
+		return ret;
 
 	/* Set DSM_VOL_CTRL - Tweeter more quiet than woofer */
 	if (is_tweeter)
-		regmap_write(priv->regmap, 0x23BA, 0x8d);
+		ret = max98390_write_checked(priv, 0x23ba, 0x8d);
 	else
-		regmap_write(priv->regmap, 0x23BA, 0xA0);
+		ret = max98390_write_checked(priv, 0x23ba, 0xa0);
+	if (ret < 0)
+		return ret;
 
 	/* SET DSP_GLOBAL_EN TO 1 */
-	regmap_write(priv->regmap, 0x23E1, 0x01);
+	ret = max98390_write_checked(priv, MAX98390_R23E1_DSP_GLOBAL_EN, 0x01);
+	if (ret < 0)
+		return ret;
 
 	/* SET SPK_EN TO 1 */
-	regmap_write(priv->regmap, 0x203A, 0x81);
+	ret = max98390_write_checked(priv, MAX98390_R203A_AMP_EN, 0x81);
+	if (ret < 0)
+		return ret;
 
 	/* SET EN TO 1 */
-	regmap_write(priv->regmap, 0x23FF, 0x01);
+	return max98390_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0x01);
 }
 
 MODULE_DESCRIPTION("HDA MAX98390 filter configuration");

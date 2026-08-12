@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${FAKE_STATE_DIR:?FAKE_STATE_DIR must point to the fixture state directory}"
+
+while (( $# > 0 )) && [[ "$1" == -* ]]; do
+    shift
+done
+
+(( $# >= 2 )) || exit 2
+
+bus="$1"
+address="$2"
+count_file="$FAKE_STATE_DIR/i2cget-${address}.count"
+responses_file="$FAKE_STATE_DIR/i2c-responses"
+count=0
+required_attempt=''
+
+if [[ -f "$count_file" ]]; then
+    IFS= read -r count < "$count_file"
+fi
+
+count=$((count + 1))
+printf '%d\n' "$count" > "$count_file"
+printf 'i2cget|%s|%s|%d\n' "$bus" "$address" "$count" >> "$FAKE_STATE_DIR/commands.log"
+
+if [[ -f "$responses_file" ]]; then
+    while read -r configured_address configured_attempt _; do
+        [[ -n "${configured_address:-}" ]] || continue
+        if [[ "$configured_address" == "$address" ]]; then
+            required_attempt="$configured_attempt"
+            break
+        fi
+    done < "$responses_file"
+fi
+
+[[ "$required_attempt" =~ ^[0-9]+$ ]] || exit 1
+(( count >= required_attempt ))

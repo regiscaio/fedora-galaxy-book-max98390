@@ -8,7 +8,8 @@
 
 struct max98390_hda_priv;
 
-void max98390_configure_filters(struct max98390_hda_priv *priv);
-void max98390_configure_high_pass_filter(struct max98390_hda_priv *priv, int cutoff_freq, bool is_tweeter);
+int max98390_configure_filters(struct max98390_hda_priv *priv);
+int max98390_configure_high_pass_filter(struct max98390_hda_priv *priv,
+					int cutoff_freq, bool is_tweeter);
 
 #endif /* __MAX98390_HDA_FILTERS_H */

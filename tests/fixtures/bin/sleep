@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${FAKE_STATE_DIR:?FAKE_STATE_DIR must point to the fixture state directory}"
+
+printf 'sleep|%s\n' "${1:-}" >> "$FAKE_STATE_DIR/commands.log"

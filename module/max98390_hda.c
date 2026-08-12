@@ -5,15 +5,35 @@
 // Based on PR #5616 from thesofproject/linux by Kevin Cuperus
 //
 
+#include <linux/component.h>
+#include <linux/err.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
-#include <linux/component.h>
 #include <sound/hda_codec.h>
 #include "hda_scodec_component.h"
 #include "hda_generic.h"
 #include "max98390_hda.h"
 #include "max98390_hda_filters.h"
 #include "max98390_regs.h"
+
+static int max98390_hda_write_checked(struct max98390_hda_priv *priv,
+				      unsigned int reg, unsigned int value)
+{
+	int ret;
+
+	ret = regmap_write(priv->regmap, reg, value);
+	if (ret < 0)
+		dev_err(priv->dev, "Failed to write register 0x%04x: %d\n",
+			reg, ret);
+
+	return ret;
+}
+
+static void max98390_hda_disable(struct max98390_hda_priv *priv)
+{
+	max98390_hda_write_checked(priv, MAX98390_R203A_AMP_EN, 0x80);
+	max98390_hda_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0x00);
+}
 
 static void max98390_hda_playback_hook(struct device *dev, int action)
 {
@@ -36,8 +56,7 @@ static void max98390_hda_playback_hook(struct device *dev, int action)
 
 	case HDA_GEN_PCM_ACT_CLOSE:
 		/* Disable speaker amp and global */
-		regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
-		regmap_write(priv->regmap, MAX98390_R23FF_GLOBAL_EN, 0x00);
+		max98390_hda_disable(priv);
 		break;
 
 	default:
@@ -87,53 +106,66 @@ static const struct component_ops max98390_hda_comp_ops = {
 
 static int max98390_hda_init(struct max98390_hda_priv *priv)
 {
+	static const struct reg_sequence initial_settings[] = {
+		{ MAX98390_CLK_MON, 0x6f },
+		{ MAX98390_DAT_MON, 0x00 },
+		{ MAX98390_PWR_GATE_CTL, 0x00 },
+		{ MAX98390_PCM_RX_EN_A, 0x03 },
+		{ MAX98390_ENV_TRACK_VOUT_HEADROOM, 0x0e },
+		{ MAX98390_BOOST_BYPASS1, 0x46 },
+		{ MAX98390_FET_SCALING3, 0x03 },
+		{ MAX98390_PCM_MODE_CFG, 0xc0 },
+		{ MAX98390_PCM_MASTER_MODE, 0x1c },
+		{ MAX98390_PCM_CLK_SETUP, 0x44 },
+		{ MAX98390_PCM_SR_SETUP, 0x08 },
+	};
+	size_t i;
 	int ret;
 	unsigned int reg;
 
 	/* Check device ID */
 	ret = regmap_read(priv->regmap, MAX98390_R24FF_REV_ID, &reg);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(priv->dev, "Failed to read revision ID: %d\n", ret);
 		return ret;
+	}
 
 	/* Software reset */
-	ret = regmap_write(priv->regmap, MAX98390_SOFTWARE_RESET, 0x01);
+	ret = max98390_hda_write_checked(priv, MAX98390_SOFTWARE_RESET, 0x01);
 	if (ret < 0)
 		return ret;
 
 	msleep(20);
 
-	/* Basic register initialization (minimal setup for HDA) */
-	regmap_write(priv->regmap, MAX98390_CLK_MON, 0x6f);
-	regmap_write(priv->regmap, MAX98390_DAT_MON, 0x00);
-	regmap_write(priv->regmap, MAX98390_PWR_GATE_CTL, 0x00);
-	regmap_write(priv->regmap, MAX98390_PCM_RX_EN_A, 0x03);
-	regmap_write(priv->regmap, MAX98390_ENV_TRACK_VOUT_HEADROOM, 0x0e);
-	regmap_write(priv->regmap, MAX98390_BOOST_BYPASS1, 0x46);
-	regmap_write(priv->regmap, MAX98390_FET_SCALING3, 0x03);
-
-	/* PCM/I2S configuration - CRITICAL for correct audio format */
-	/* 0xC0 = I2S mode, 32-bit samples (standard for HDA) */
-	regmap_write(priv->regmap, MAX98390_PCM_MODE_CFG, 0xc0);
-	regmap_write(priv->regmap, MAX98390_PCM_MASTER_MODE, 0x1c);
-	regmap_write(priv->regmap, MAX98390_PCM_CLK_SETUP, 0x44);
-	regmap_write(priv->regmap, MAX98390_PCM_SR_SETUP, 0x08);
+	/* Basic register and PCM/I2S initialization for the HDA path. */
+	for (i = 0; i < ARRAY_SIZE(initial_settings); i++) {
+		ret = max98390_hda_write_checked(priv, initial_settings[i].reg,
+						 initial_settings[i].def);
+		if (ret < 0)
+			return ret;
+	}
 
 	/* RESET EN - Write 0x00 to 0x23FF */
-	regmap_write(priv->regmap, MAX98390_R23FF_GLOBAL_EN, 0x00);
+	ret = max98390_hda_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0x00);
+	if (ret < 0)
+		return ret;
 
 	/* Wait 50ms */
 	msleep(50);
 
 	/* RESET SPK_EN - Write 0x80 to 0x203A */
-	regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
+	ret = max98390_hda_write_checked(priv, MAX98390_R203A_AMP_EN, 0x80);
+	if (ret < 0)
+		return ret;
 
 	/* RESET DSP_GLOBAL_EN - Write 0x00 to 0x23E1 */
-	regmap_write(priv->regmap, MAX98390_R23E1_DSP_GLOBAL_EN, 0x00);
+	ret = max98390_hda_write_checked(priv,
+					  MAX98390_R23E1_DSP_GLOBAL_EN, 0x00);
+	if (ret < 0)
+		return ret;
 
 	/* Configure filters and load DSM firmware */
-	max98390_configure_filters(priv);
-
-	return 0;
+	return max98390_configure_filters(priv);
 }
 
 int max98390_hda_probe(struct device *dev, const char *device_name,
@@ -146,6 +178,10 @@ int max98390_hda_probe(struct device *dev, const char *device_name,
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	if (IS_ERR(regmap))
+		return PTR_ERR(regmap);
+	if (!regmap)
+		return -EINVAL;
 
 	priv->dev = dev;
 	priv->regmap = regmap;
@@ -156,12 +192,16 @@ int max98390_hda_probe(struct device *dev, const char *device_name,
 	dev_set_drvdata(dev, priv);
 
 	ret = max98390_hda_init(priv);
-	if (ret)
+	if (ret) {
+		max98390_hda_disable(priv);
 		return ret;
+	}
 
 	ret = component_add(dev, &max98390_hda_comp_ops);
-	if (ret)
+	if (ret) {
+		max98390_hda_disable(priv);
 		return ret;
+	}
 
 	return 0;
 }
@@ -175,7 +215,7 @@ void max98390_hda_remove(struct device *dev)
 
 	if (priv && priv->regmap) {
 		/* Disable amp on removal */
-		regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
+		max98390_hda_disable(priv);
 	}
 }
 EXPORT_SYMBOL_NS_GPL(max98390_hda_remove, "SND_HDA_SCODEC_MAX98390");
@@ -183,8 +223,11 @@ EXPORT_SYMBOL_NS_GPL(max98390_hda_remove, "SND_HDA_SCODEC_MAX98390");
 static int max98390_hda_runtime_suspend(struct device *dev)
 {
 	struct max98390_hda_priv *priv = dev_get_drvdata(dev);
+	int ret;
 
-	regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
+	ret = regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
+	if (ret < 0)
+		return ret;
 	regcache_cache_only(priv->regmap, true);
 	regcache_mark_dirty(priv->regmap);
 
@@ -196,9 +239,7 @@ static int max98390_hda_runtime_resume(struct device *dev)
 	struct max98390_hda_priv *priv = dev_get_drvdata(dev);
 
 	regcache_cache_only(priv->regmap, false);
-	regcache_sync(priv->regmap);
-
-	return 0;
+	return regcache_sync(priv->regmap);
 }
 
 const struct dev_pm_ops max98390_hda_pm_ops = {

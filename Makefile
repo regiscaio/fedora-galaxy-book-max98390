@@ -12,11 +12,12 @@ RPMBUILD_DIR := .rpmbuild
 GENERATED_SPEC := $(RPMBUILD_DIR)/SPECS/$(PACKAGE_NAME).spec
 TAR_REPRO_FLAGS := --sort=name --mtime="@$(SOURCE_DATE_EPOCH)" --owner=0 --group=0 --numeric-owner
 
-.PHONY: help build clean dist srpm rpm
+.PHONY: help build test clean dist srpm rpm
 
 help:
 	@printf '%s\n' \
 		'make build  Build the external modules for the running kernel' \
+		'make test   Run the helper and Fedora packaging regression tests' \
 		'make dist   Create a source tarball in dist/' \
 		'make srpm   Create a source RPM in dist/' \
 		'make rpm    Create akmod/meta RPMs and a source RPM in dist/' \
@@ -24,6 +25,9 @@ help:
 
 build:
 	$(MAKE) -C module
+
+test:
+	./tests/run.sh
 
 clean:
 	$(MAKE) -C module clean >/dev/null 2>&1 || true

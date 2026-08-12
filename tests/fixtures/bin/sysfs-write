@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${FAKE_STATE_DIR:?FAKE_STATE_DIR must point to the fixture state directory}"
+: "${MAX98390_SYSFS_ROOT:?MAX98390_SYSFS_ROOT must point to the fixture sysfs root}"
+
+(( $# >= 2 )) || exit 2
+
+path="$1"
+shift
+value="$*"
+operation="$(basename -- "$path")"
+case "$path" in
+    "$MAX98390_SYSFS_ROOT"/bus/i2c/devices/i2c-*/new_device|\
+    "$MAX98390_SYSFS_ROOT"/bus/i2c/devices/i2c-*/delete_device)
+        adapter="$(basename -- "$(dirname -- "$path")")"
+        bus="${adapter#i2c-}"
+        [[ "$adapter" == "i2c-$bus" && "$bus" =~ ^[0-9]+$ ]] || exit 2
+        ;;
+    "$MAX98390_SYSFS_ROOT"/bus/i2c/drivers/max98390-hda/bind)
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+
+printf 'write|%s|%s\n' "$operation" "$value" >> "$FAKE_STATE_DIR/commands.log"
+
+case "$operation" in
+    new_device)
+        driver="${value%% *}"
+        address="${value##* }"
+        [[ "$driver" == "max98390-hda" && "$address" == 0x* ]] || exit 2
+
+        case " ${FAKE_WRITE_FAIL_ADDRS:-} " in
+            *" $address "*) exit 1 ;;
+        esac
+
+        device="$MAX98390_SYSFS_ROOT/bus/i2c/devices/${bus}-00${address#0x}"
+        mkdir -p -- "$device"
+        printf '%s\n' "$driver" > "$device/name"
+        printf 'i2c:%s\n' "$driver" > "$device/modalias"
+
+        case " ${FAKE_UNBOUND_ADDRS:-} " in
+            *" $address "*) exit 0 ;;
+        esac
+
+        ln -sfn -- \
+            "$MAX98390_SYSFS_ROOT/bus/i2c/drivers/max98390-hda" \
+            "$device/driver"
+        ;;
+    delete_device)
+        address="$value"
+        [[ "$address" == 0x* ]] || exit 2
+        case " ${FAKE_DELETE_FAIL_ADDRS:-} " in
+            *" $address "*) exit 1 ;;
+        esac
+        device="$MAX98390_SYSFS_ROOT/bus/i2c/devices/${bus}-00${address#0x}"
+        case "$device" in
+            "$MAX98390_SYSFS_ROOT"/bus/i2c/devices/"${bus}"-00*) ;;
+            *) exit 2 ;;
+        esac
+        if [[ -e "$device" || -L "$device" ]]; then
+            find "$device" -depth -delete
+        fi
+        ;;
+    bind)
+        device_id="$value"
+        [[ "$device_id" =~ ^[0-9]+-[[:xdigit:]]{4}$ ||
+           "$device_id" =~ ^i2c-MA?X98390:[[:xdigit:]]{2}$ ]] || exit 2
+        case " ${FAKE_BIND_FAIL_IDS:-} " in
+            *" $device_id "*) exit 1 ;;
+        esac
+
+        device="$MAX98390_SYSFS_ROOT/bus/i2c/devices/$device_id"
+        [[ -d "$device" ]] || exit 1
+        ln -sfn -- \
+            "$MAX98390_SYSFS_ROOT/bus/i2c/drivers/max98390-hda" \
+            "$device/driver"
+        ;;
+    *)
+        exit 2
+        ;;
+esac

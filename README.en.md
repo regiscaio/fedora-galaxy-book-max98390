@@ -7,6 +7,10 @@
 
 # Galaxy Book MAX98390
 
+RPM/akmod packaging for the `MAX98390` driver path used by the internal
+speakers on Samsung Galaxy Book laptops under Fedora, initially focused on the
+Galaxy Book4 Ultra.
+
 ## Quick install
 
 ```bash
@@ -14,9 +18,10 @@ sudo dnf config-manager addrepo --from-repofile=https://packages.caioregis.com/f
 sudo dnf install akmod-galaxybook-max98390
 ```
 
-RPM/akmod packaging for the `MAX98390` driver path used by the internal
-speakers on Samsung Galaxy Book laptops under Fedora, initially focused on the
-Galaxy Book4 Ultra.
+The `akmod` package contains the sources and build recipe. `akmods` builds and
+installs a `kmod-galaxybook-max98390-<kernel-release>` RPM for each kernel,
+containing the two modules built specifically for that release. A module built
+for another kernel is never reused.
 
 ## Goal
 
@@ -26,10 +31,83 @@ missing part on those models is the `MAX98390` amplifier side.
 
 This repository organizes that support in the Fedora way:
 
-- external modules rebuilt with `akmods`;
-- module autoload at boot;
-- a boot service that creates the missing I2C amplifier devices;
-- a helper to detect when the kernel already has sufficient native support.
+- external modules rebuilt and delivered per kernel with `akmods`;
+- a boot service that waits for `akmods`, explicitly loads both modules, and
+  creates the missing I2C devices;
+- bounded retries while ACPI, I2C, the modules, and the amplifiers become
+  available;
+- validation that the devices are bound to `max98390-hda` before the service
+  reports success;
+- a diagnostic helper that indicates when the kernel appears to contain every
+  part of the native implementation.
+
+No `modules-load.d` file is installed. On the first boot into a new kernel,
+trying to load the modules before `akmods` finishes would create a race. The
+service therefore loads them only after their per-kernel build. The unit is
+automatically skipped on machines without a MAX98390 ACPI device.
+
+The target topology is the Galaxy Book4 Ultra's: one ACPI-created client and
+three additional amplifiers at `0x39`, `0x3c`, and `0x3d`. The service only
+completes when all four bindings exist; another topology requires an explicit
+profile before use.
+
+## Fedora 44 and Linux 7.1
+
+On the currently verified combination, Fedora 44 with Linux 7.1, this
+workaround is still required on affected systems. The kernel does not yet
+combine the instantiation of every amplifier, the corresponding
+`snd-hda-codec-alc269` quirk, and the `MAX98390` HDA side-codec.
+
+`max98390-hda-check-upstream.service` performs a conservative check and only
+reports its result to the journal. It does not remove or disable the package.
+Even a native-support-detected message does not guarantee that a future kernel
+will work on this laptop: verify the bindings and perform a real listening test
+before removing the workaround.
+
+## Current power-management limitation
+
+On the audited Linux 7.1 kernel, `alc269` still does not create the component
+master needed to bind the side-codec to the HDA codec. The fallback therefore
+enables the DSP and amplifiers during probe. The amplifiers may remain powered
+when nothing is playing, increasing idle power consumption.
+
+This is a known limitation of the workaround and is not equivalent to complete
+native integration with power management. There is no promise about when that
+integration will reach the kernel shipped by Fedora.
+
+## Diagnostics and validation
+
+The commands below are read-only:
+
+```bash
+kernel_release="$(uname -r)"
+
+modinfo -k "$kernel_release" snd-hda-scodec-max98390
+modinfo -k "$kernel_release" snd-hda-scodec-max98390-i2c
+
+systemctl is-enabled max98390-hda-i2c-setup.service
+systemctl is-active max98390-hda-i2c-setup.service
+journalctl -b -u akmods.service -u max98390-hda-i2c-setup.service \
+  -u max98390-hda-check-upstream.service --no-pager
+
+find /sys/bus/i2c/devices -maxdepth 2 -type l -name driver \
+  -lname '*max98390-hda*' -print
+
+for module_name in snd-hda-scodec-max98390 snd-hda-scodec-max98390-i2c; do
+  module_path="$(modinfo -k "$kernel_release" -n "$module_name")" || continue
+  printf '%s -> ' "$module_path"
+  rpm -qf "$module_path"
+done
+```
+
+Both `modinfo` commands must locate modules for the running kernel. Those files
+must belong to that release's `kmod` RPM, and the discovered I2C clients must
+be bound to `max98390-hda`. If `modinfo` reports `Module not found`, inspect the
+`akmods` log first: manually copying a `.ko` into `/lib/modules` hides the
+problem and leaves the file outside RPM management.
+
+Repeat this validation after every kernel update. The definitive test remains
+playing audio through the internal speakers after booting the new kernel.
 
 ## Scope
 
@@ -53,10 +131,11 @@ line.
 
 ## Structure
 
-- `module/`: sources for `snd-hda-scodec-max98390` and `snd-hda-scodec-max98390-i2c`
-- `scripts/`: boot helpers and native-support checks
-- `data/`: `modules-load.d` files and `systemd` units
-- `packaging/fedora/`: RPM spec
+- `module/`: sources for `snd-hda-scodec-max98390` and
+  `snd-hda-scodec-max98390-i2c`
+- `scripts/`: boot helper and native-support check
+- `data/`: `systemd` units
+- `packaging/fedora/`: RPM/akmod spec and per-kernel payload generation
 
 ## Local build
 
@@ -65,11 +144,7 @@ make build
 make rpm
 ```
 
-Generated RPMs are placed in `dist/`.
-
-## Current status
-
-The goal of this first line is to deliver a testable and reproducible Fedora
-package for the `MAX98390` path. Build validation is part of this repository;
-audible validation on real hardware must be treated as the integration step on
-the target notebook.
+`make build` compiles against the running kernel. `make rpm` creates the source
+package and the entry packages for the akmod flow; the loadable,
+kernel-specific payload is produced when `akmods` builds for that release.
+Local artifacts are placed in `dist/`.

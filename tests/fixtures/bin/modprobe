@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${FAKE_STATE_DIR:?FAKE_STATE_DIR must point to the fixture state directory}"
+
+module="${1:-}"
+[[ -n "$module" ]] || exit 2
+
+printf 'modprobe|%s\n' "$module" >> "$FAKE_STATE_DIR/commands.log"
+
+case " ${FAKE_MODPROBE_FAIL_MODULES:-} " in
+    *" $module "*) exit 1 ;;
+esac

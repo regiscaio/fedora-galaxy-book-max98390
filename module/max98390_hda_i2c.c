@@ -4,9 +4,10 @@
 // Based on PR #5616 from thesofproject/linux by Kevin Cuperus
 //
 
+#include <linux/err.h>
+#include <linux/i2c.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
-#include <linux/i2c.h>
 
 #include "max98390_hda.h"
 #include "max98390_regs.h"
@@ -14,6 +15,7 @@
 static int max98390_hda_i2c_probe(struct i2c_client *clt)
 {
 	const char *name_suffix;
+	struct regmap *regmap;
 	int index;
 
 	/*
@@ -41,9 +43,13 @@ static int max98390_hda_i2c_probe(struct i2c_client *clt)
 	dev_info(&clt->dev, "MAX98390 HDA I2C probe: addr=0x%02x index=%d name=%s\n",
 		 clt->addr, index, dev_name(&clt->dev));
 
+	regmap = devm_regmap_init_i2c(clt, &max98390_regmap);
+	if (IS_ERR(regmap))
+		return dev_err_probe(&clt->dev, PTR_ERR(regmap),
+				     "Failed to initialize regmap\n");
+
 	return max98390_hda_probe(&clt->dev, "MAX98390", index, clt->irq,
-				  devm_regmap_init_i2c(clt, &max98390_regmap),
-				  MAX98390_HDA_I2C, clt->addr);
+				  regmap, MAX98390_HDA_I2C, clt->addr);
 }
 
 static void max98390_hda_i2c_remove(struct i2c_client *clt)
