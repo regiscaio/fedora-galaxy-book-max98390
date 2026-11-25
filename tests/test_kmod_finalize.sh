@@ -43,7 +43,11 @@ kmod_lifecycle_lock_expected_gid="$(id -g)"
 kmod_lifecycle_lock_ancestry=("$TEST_ROOT" "$TEST_ROOT/locks")
 
 FAKE_PAYLOAD_OWNER=""
+FAKE_PAYLOAD_EVR="0:1.00.12-1.fc44"
 FAKE_LEGACY_OWNER=""
+FAKE_LEGACY_EVR="0:1.00.10-1.fc44"
+FAKE_COMMON_EVR="0:1.00.12-1.fc44"
+FAKE_RPM_TRAILING_DIAGNOSTIC=0
 FAKE_WRONG_VERMAGIC=0
 FAKE_TRANSIENT_REMAINING_FILE="$TEST_ROOT/transient-remaining"
 FAKE_BLOCK_REQUEST="$TEST_ROOT/block-request"
@@ -62,6 +66,7 @@ FAKE_LEGACY_SWAP_REPLACEMENT=""
 FAKE_ASSERT_GLOBAL_HELD=0
 
 fake_rpm() {
+    local query="$1"
     local path="${*: -1}"
     local remaining=0
 
@@ -83,18 +88,33 @@ fake_rpm() {
         if (( remaining > 0 )); then
             printf '%s\n' "$((remaining - 1))" > "$FAKE_TRANSIENT_REMAINING_FILE"
             printf '%s\n' "error: can't create transaction lock (Resource temporarily unavailable)" >&2
-            printf '%s\n' "$FAKE_PAYLOAD_OWNER"
+            if [[ "$query" == -qf ]]; then
+                printf '%s\t%s\n' "$FAKE_PAYLOAD_OWNER" "$FAKE_PAYLOAD_EVR"
+            else
+                printf '%s\n' "$FAKE_COMMON_EVR"
+            fi
             return 0
         fi
     fi
 
+    if [[ "$query" == -q ]]; then
+        if [[ "$path" == "$COMMON_PACKAGE" && -n "$FAKE_COMMON_EVR" ]]; then
+            printf '%s\n' "$FAKE_COMMON_EVR"
+            return 0
+        fi
+        printf 'package %s is not installed\n' "$path" >&2
+        return 1
+    fi
     case "$path" in
         */extra/galaxybook-max98390/*)
-            printf '%s\n' "$FAKE_PAYLOAD_OWNER"
+            printf '%s\t%s\n' "$FAKE_PAYLOAD_OWNER" "$FAKE_PAYLOAD_EVR"
+            if (( FAKE_RPM_TRAILING_DIAGNOSTIC == 1 )); then
+                printf '%s\n' 'warning: synthetic trailing RPM diagnostic' >&2
+            fi
             ;;
         */updates/*)
             if [[ -n "$FAKE_LEGACY_OWNER" ]]; then
-                printf '%s\n' "$FAKE_LEGACY_OWNER"
+                printf '%s\t%s\n' "$FAKE_LEGACY_OWNER" "$FAKE_LEGACY_EVR"
             else
                 printf 'file %s is not owned by any package\n' "$path" >&2
                 return 1
@@ -190,7 +210,11 @@ new_kernel_fixture() {
     : > "${expected_dir}/${CORE_MODULE}.ko.zst"
     : > "${expected_dir}/${I2C_MODULE}.ko.zst"
     FAKE_PAYLOAD_OWNER="kmod-galaxybook-max98390-${kernel}"
+    FAKE_PAYLOAD_EVR="0:1.00.12-1.fc44"
     FAKE_LEGACY_OWNER=""
+    FAKE_LEGACY_EVR="0:1.00.10-1.fc44"
+    FAKE_COMMON_EVR="0:1.00.12-1.fc44"
+    FAKE_RPM_TRAILING_DIAGNOSTIC=0
     FAKE_WRONG_VERMAGIC=0
 }
 
@@ -227,17 +251,20 @@ alternate_group_id() {
     printf '%s\n' "$EXPECTED_STATE_GID"
 }
 
-test_finalizer_validates_then_removes_unmanaged_legacy() {
-    local kernel=7.1.8-success.x86_64 legacy
+test_unmanaged_legacy_is_preserved_and_priority_allows_activation() {
+    local kernel=7.1.8-unmanaged-legacy.x86_64 legacy output
 
     new_kernel_fixture "$kernel"
     legacy="$(legacy_path "$kernel" "$CORE_MODULE")"
     queue_kernel "$kernel" >/dev/null
-    finalize_kernel "$kernel" >/dev/null
+    : > "$FAKE_DEPMOD_CALLS"
+    output="$TEST_ROOT/unmanaged-legacy.out"
+    finalize_kernel "$kernel" >"$output" 2>&1
 
-    assert_missing "$legacy"
+    [[ -f "$legacy" ]]
     assert_missing "${PENDING_DIR}/${kernel}.pending"
     grep -Fxq -- "-a $kernel" "$FAKE_DEPMOD_CALLS"
+    grep -Fq -- "Preserving unmanaged legacy override $legacy" "$output"
 }
 
 test_owner_or_vermagic_failure_preserves_legacy() {
@@ -269,6 +296,46 @@ test_owner_or_vermagic_failure_preserves_legacy() {
     rm -f -- "${PENDING_DIR}/${vermagic_kernel}.pending"
 }
 
+test_stale_payload_evr_preserves_marker_without_depmod() {
+    local kernel=7.1.8-stale-evr.x86_64 output
+
+    new_kernel_fixture "$kernel"
+    queue_kernel "$kernel" >/dev/null
+    FAKE_PAYLOAD_EVR="0:1.00.11-1.fc44"
+    : > "$FAKE_DEPMOD_CALLS"
+    output="$TEST_ROOT/stale-evr.out"
+    if finalize_kernel "$kernel" >"$output" 2>&1; then
+        printf 'stale payload EVR was accepted\n' >&2
+        return 1
+    fi
+
+    [[ -f "${PENDING_DIR}/${kernel}.pending" ]]
+    [[ ! -s "$FAKE_DEPMOD_CALLS" ]]
+    grep -Fq -- \
+        "expected kmod-galaxybook-max98390-${kernel}-${FAKE_COMMON_EVR}" \
+        "$output"
+    rm -f -- "${PENDING_DIR}/${kernel}.pending"
+}
+
+test_success_status_with_trailing_rpm_diagnostic_is_rejected() {
+    local kernel=7.1.8-rpm-trailing-diagnostic.x86_64
+
+    new_kernel_fixture "$kernel"
+    queue_kernel "$kernel" >/dev/null
+    FAKE_RPM_TRAILING_DIAGNOSTIC=1
+    : > "$FAKE_DEPMOD_CALLS"
+    if finalize_kernel "$kernel" >"$TEST_ROOT/rpm-trailing-diagnostic.out" 2>&1; then
+        printf 'RPM owner output with a trailing diagnostic was accepted\n' >&2
+        return 1
+    fi
+
+    [[ -f "${PENDING_DIR}/${kernel}.pending" ]]
+    [[ ! -s "$FAKE_DEPMOD_CALLS" ]]
+    grep -Fq -- 'RPM database did not become safely queryable' \
+        "$TEST_ROOT/rpm-trailing-diagnostic.out"
+    rm -f -- "${PENDING_DIR}/${kernel}.pending"
+}
+
 test_rpm_owned_legacy_is_preserved() {
     local kernel=7.1.8-owned-legacy.x86_64 legacy
 
@@ -279,7 +346,7 @@ test_rpm_owned_legacy_is_preserved() {
     [[ -f "$legacy" ]]
 }
 
-test_legacy_cleanup_rejects_symlink_and_hardlink() {
+test_legacy_metadata_rejects_symlink_and_hardlink() {
     local symlink_kernel=7.1.8-legacy-symlink.x86_64
     local hardlink_kernel=7.1.8-legacy-hardlink.x86_64
     local symlink_path hardlink_path alias target
@@ -291,7 +358,7 @@ test_legacy_cleanup_rejects_symlink_and_hardlink() {
     rm -f -- "$symlink_path"
     ln -s "$target" "$symlink_path"
     if finalize_kernel "$symlink_kernel" >/dev/null 2>&1; then
-        printf 'symlink legacy override was accepted for cleanup\n' >&2
+        printf 'symlink legacy override was accepted for priority processing\n' >&2
         return 1
     fi
     [[ -L "$symlink_path" && -f "$target" ]]
@@ -301,13 +368,13 @@ test_legacy_cleanup_rejects_symlink_and_hardlink() {
     alias="${hardlink_path}.alias"
     ln "$hardlink_path" "$alias"
     if finalize_kernel "$hardlink_kernel" >/dev/null 2>&1; then
-        printf 'hard-linked legacy override was accepted for cleanup\n' >&2
+        printf 'hard-linked legacy override was accepted for priority processing\n' >&2
         return 1
     fi
     [[ -f "$hardlink_path" && -f "$alias" ]]
 }
 
-test_legacy_cleanup_rejects_identity_swap_before_unlink() {
+test_legacy_identity_swap_is_rejected_before_depmod() {
     local kernel=7.1.8-legacy-swap.x86_64
     local source trigger replacement
 
@@ -322,7 +389,7 @@ test_legacy_cleanup_rejects_identity_swap_before_unlink() {
     FAKE_LEGACY_SWAP_REPLACEMENT="$replacement"
 
     if finalize_kernel "$kernel" >/dev/null 2>&1; then
-        printf 'legacy identity swap before unlink was accepted\n' >&2
+        printf 'legacy identity swap before depmod was accepted\n' >&2
         return 1
     fi
     [[ "$(< "$source")" == replacement-must-survive ]]
@@ -921,11 +988,13 @@ test_inherited_global_lock_is_reused_before_private_and_rpm() {
     unset GALAXYBOOK_KMOD_LIFECYCLE_LOCK_FD
 }
 
-test_finalizer_validates_then_removes_unmanaged_legacy
+test_unmanaged_legacy_is_preserved_and_priority_allows_activation
 test_owner_or_vermagic_failure_preserves_legacy
+test_stale_payload_evr_preserves_marker_without_depmod
+test_success_status_with_trailing_rpm_diagnostic_is_rejected
 test_rpm_owned_legacy_is_preserved
-test_legacy_cleanup_rejects_symlink_and_hardlink
-test_legacy_cleanup_rejects_identity_swap_before_unlink
+test_legacy_metadata_rejects_symlink_and_hardlink
+test_legacy_identity_swap_is_rejected_before_depmod
 test_trigger_only_queues_exact_paths_without_rpm_query
 test_pending_marker_rejects_hardlinks
 test_lock_warning_is_retried_and_never_emitted

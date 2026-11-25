@@ -3,6 +3,8 @@
 %global pkg_version %{?pkg_version_override}%{!?pkg_version_override:1.0.0}
 %global source_date_epoch_from_changelog 0
 %global clamp_mtime_to_source_date_epoch 1
+%{!?_depmoddir:%global _depmoddir %{_prefix}/lib/depmod.d}
+%global finalizer_interpreter /usr/bin/env -i PATH=/usr/bin:/usr/sbin GALAXYBOOK_FINALIZER_FAMILY=max98390 GALAXYBOOK_FINALIZER_COMMON_PACKAGE=galaxybook-max98390-kmod-common GALAXYBOOK_FINALIZER_OWN_FLOOR=0:1.00.12-0 GALAXYBOOK_FINALIZER_PEER_PACKAGE=galaxybook-ov02c10-kmod-common GALAXYBOOK_FINALIZER_PEER_FLOOR=0:1.00.25-0 GALAXYBOOK_FINALIZER_SETUP_PACKAGE=galaxybook-setup GALAXYBOOK_FINALIZER_SETUP_FLOOR=0:1.00.48-0 GALAXYBOOK_FINALIZER_ACTIVATOR_UNITS=max98390-kmod-finalize.path GALAXYBOOK_FINALIZER_DEPENDENT_UNITS=max98390-hda-i2c-setup.service GALAXYBOOK_FINALIZER_SERVICE_UNIT=max98390-kmod-finalize.service GALAXYBOOK_FINALIZER_PENDING_DIRECTORY=/var/lib/galaxybook-max98390/pending GALAXYBOOK_FINALIZER_RECOVERY_UNIT=galaxybook-max98390-finalizer-transaction-recovery.service GALAXYBOOK_FINALIZER_STATE_DIRECTORY=/run/galaxybook-max98390-finalizer-transaction GALAXYBOOK_FINALIZER_SERVICE_CGROUP=/sys/fs/cgroup/system.slice/max98390-kmod-finalize.service/cgroup.procs /usr/bin/bash --noprofile --norc
 
 Name:           %{prjname}-kmod
 Version:        %{pkg_version}
@@ -11,17 +13,28 @@ Summary:        MAX98390 speaker amplifier driver for Samsung Galaxy Book on Fed
 License:        GPL-2.0-only
 URL:            https://github.com/regiscaio/fedora-galaxy-book-max98390
 Source0:        %{name}-%{version}.tar.gz
+Source1:        kmodtool-queue-only-filter.sh
+Source2:        finalizer-transaction.sh
+Source3:        finalizer-transaction-pretrans.sh
 
 ExclusiveArch:  x86_64
 
 BuildRequires:  akmods
+BuildRequires:  bash
+BuildRequires:  coreutils
+BuildRequires:  diffutils
 BuildRequires:  elfutils-libelf-devel
 BuildRequires:  gcc
 BuildRequires:  kmodtool
 BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
 
-%{expand:%(kmodtool --target %{_target_cpu} --repo fedora --kmodname %{prjname} --akmod %{?kernels:--for-kernels "%{?kernels}"} 2>/dev/null)}
+%global kmodtool_queue_only_filter_ok 0
+%{expand:%(/usr/bin/bash "%{SOURCE1}" --expected-kernels "%{?kernels}" -- /usr/bin/kmodtool --target %{_target_cpu} --repo fedora --kmodname %{prjname} --akmod %{?kernels:--for-kernels "%{?kernels}"})}
+%if %{kmodtool_queue_only_filter_ok} != 1
+%{error:kmodtool queue-only filtering failed}
+%endif
+%undefine kmodtool_queue_only_filter_ok
 
 %description
 This package ships the out-of-tree MAX98390 HDA side-codec modules needed by
@@ -34,6 +47,7 @@ Summary:        Common files for the %{prjname} kernel module packaging
 Requires:       bash
 Requires:       binutils
 Requires:       coreutils
+Requires:       diffutils
 Requires:       findutils
 Requires:       grep
 Requires:       gzip
@@ -45,10 +59,24 @@ Requires:       systemd
 Requires:       util-linux-core
 Requires:       xz
 Requires:       zstd
+Requires:       (galaxybook-ov02c10-kmod-common >= 1.00.25 if galaxybook-ov02c10-kmod-common)
+Requires:       (galaxybook-setup >= 1.00.48 if galaxybook-setup)
 Recommends:     alsa-sof-firmware
+Requires(pretrans): bash
+Requires(pretrans): coreutils
+Requires(pretrans): diffutils
+Requires(pretrans): rpm
+Requires(pretrans): systemd
+Requires(pretrans): util-linux-core
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
+Requires(posttrans): bash
+Requires(posttrans): coreutils
+Requires(posttrans): diffutils
+Requires(posttrans): rpm
+Requires(posttrans): systemd
+Requires(posttrans): util-linux-core
 
 %description -n %{pkg_kmod_name}-common
 Common documentation, boot-time helpers and licensing files for the
@@ -75,8 +103,12 @@ install -m 0755 scripts/max98390-hda-check-upstream.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
 install -m 0755 scripts/max98390-kmod-finalize.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
+install -Dm0755 %{SOURCE2} \
+  %{buildroot}%{_libexecdir}/%{prjname}/finalizer-transaction
 install -m 0644 scripts/kmod-lifecycle-lock.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/kmod-lifecycle-lock.sh
+install -Dm0644 data/depmod.d/galaxybook-max98390.conf \
+  %{buildroot}%{_depmoddir}/galaxybook-max98390.conf
 install -Dm0644 data/systemd/max98390-hda-i2c-setup.service \
   %{buildroot}%{_unitdir}/max98390-hda-i2c-setup.service
 install -Dm0644 data/systemd/max98390-hda-check-upstream.service \
@@ -102,6 +134,11 @@ done
 %post -n %{pkg_kmod_name}-common
 %systemd_post max98390-hda-i2c-setup.service max98390-hda-check-upstream.service max98390-kmod-finalize.path max98390-kmod-finalize.service
 
+%pretrans -n %{pkg_kmod_name}-common -p "%{finalizer_interpreter}" -f %{SOURCE3}
+
+%posttrans -n %{pkg_kmod_name}-common -p "%{finalizer_interpreter}"
+%{_libexecdir}/%{prjname}/finalizer-transaction --posttrans "$1"
+
 %preun -n %{pkg_kmod_name}-common
 %systemd_preun max98390-hda-i2c-setup.service max98390-hda-check-upstream.service max98390-kmod-finalize.path max98390-kmod-finalize.service
 
@@ -117,7 +154,9 @@ done
 %{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 %{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
 %{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh
+%{_libexecdir}/%{prjname}/finalizer-transaction
 %{_libexecdir}/%{prjname}/kmod-lifecycle-lock.sh
+%{_depmoddir}/galaxybook-max98390.conf
 %{_unitdir}/max98390-hda-i2c-setup.service
 %{_unitdir}/max98390-hda-check-upstream.service
 %{_unitdir}/max98390-kmod-finalize.path

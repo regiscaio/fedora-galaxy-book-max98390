@@ -28,10 +28,13 @@ RPM_LOCK_TIMEOUT_SECONDS="${MAX98390_RPM_LOCK_TIMEOUT_SECONDS:-90}"
 
 CORE_MODULE="snd-hda-scodec-max98390"
 I2C_MODULE="snd-hda-scodec-max98390-i2c"
+COMMON_PACKAGE="galaxybook-max98390-kmod-common"
 FINALIZER_UNIT="max98390-kmod-finalize.service"
 FINALIZER_PATH_UNIT="max98390-kmod-finalize.path"
 
 RPM_OWNER=""
+RPM_OWNER_EVR=""
+RPM_PACKAGE_EVR=""
 RPM_LOCK_FD=""
 
 log() {
@@ -249,9 +252,10 @@ validate_pending_marker() {
 
 rpm_owner_state() {
     local path="$1"
-    local output status
+    local output status owner evr
 
     RPM_OWNER=""
+    RPM_OWNER_EVR=""
     if [[ -n "$RPM_LOCK_FD" ]]; then
         # Reassert the compatible OFD read lock before every RPM query. This is
         # idempotent on the same open-file-description and authenticates that
@@ -263,13 +267,20 @@ rpm_owner_state() {
         fi
     fi
     set +e
-    output="$("$RPM_COMMAND" -qf --qf '%{NAME}\n' -- "$path" 2>&1)"
+    output="$("$RPM_COMMAND" -qf --qf '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' -- "$path" 2>&1)"
     status=$?
     set -e
 
+    owner="${output%%$'\t'*}"
+    evr="${output#*$'\t'}"
     if (( status == 0 )) \
-        && [[ "$output" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
-        RPM_OWNER="$output"
+        && [[ "$output" == "${owner}"$'\t'"${evr}" \
+        && "$output" != *$'\n'* && "$output" != *$'\r'* \
+        && "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ \
+        && "$evr" =~ ^[0-9]+:[0-9A-Za-z._+~^]+-[0-9A-Za-z._+~^]+$ \
+        ]]; then
+        RPM_OWNER="$owner"
+        RPM_OWNER_EVR="$evr"
         return 0
     fi
 
@@ -284,17 +295,71 @@ rpm_owner_state() {
     return 2
 }
 
+rpm_package_evr_state() {
+    local package="$1"
+    local output status
+
+    RPM_PACKAGE_EVR=""
+    [[ "$package" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || return 2
+    if [[ -n "$RPM_LOCK_FD" ]]; then
+        if ! validate_open_rpm_lock \
+            || ! "$FLOCK_COMMAND" --fcntl --shared --nonblock "$RPM_LOCK_FD" \
+            || ! validate_open_rpm_lock; then
+            return 2
+        fi
+    fi
+    set +e
+    output="$("$RPM_COMMAND" -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' -- "$package" 2>&1)"
+    status=$?
+    set -e
+
+    if (( status == 0 )) \
+        && [[ "$output" =~ ^[0-9]+:[0-9A-Za-z._+~^]+-[0-9A-Za-z._+~^]+$ ]]; then
+        RPM_PACKAGE_EVR="$output"
+        return 0
+    fi
+    if (( status != 0 )) \
+        && [[ "$output" == "package $package is not installed" ]]; then
+        return 1
+    fi
+    return 2
+}
+
+wait_for_package_evr() {
+    local package="$1"
+    local attempt state
+
+    for ((attempt = 1; attempt <= RPM_QUERY_ATTEMPTS; attempt++)); do
+        if rpm_package_evr_state "$package"; then
+            return 0
+        else
+            state=$?
+        fi
+        if (( state == 1 )); then
+            error "Required RPM package is not installed: $package"
+            return 1
+        fi
+        if (( attempt < RPM_QUERY_ATTEMPTS )); then
+            "$SLEEP_COMMAND" "$RPM_QUERY_DELAY_SECONDS"
+        fi
+    done
+    error "RPM database did not become safely queryable for $package"
+    return 1
+}
+
 wait_for_expected_owner() {
     local path="$1"
     local expected_owner="$2"
+    local expected_evr="$3"
     local attempt state
 
     for ((attempt = 1; attempt <= RPM_QUERY_ATTEMPTS; attempt++)); do
         if rpm_owner_state "$path"; then
-            if [[ "$RPM_OWNER" == "$expected_owner" ]]; then
+            if [[ "$RPM_OWNER" == "$expected_owner" \
+                && "$RPM_OWNER_EVR" == "$expected_evr" ]]; then
                 return 0
             fi
-            error "Unexpected RPM owner for $path: $RPM_OWNER (expected $expected_owner)"
+            error "Unexpected RPM owner or EVR for $path: ${RPM_OWNER}-${RPM_OWNER_EVR} (expected ${expected_owner}-${expected_evr})"
             return 1
         else
             state=$?
@@ -547,15 +612,15 @@ ensure_private_lock_directory() {
 
 finalize_kernel() (
     local kernel="$1"
-    local expected_owner expected_dir lock_file lock_fd module_name payload
+    local expected_owner expected_evr expected_dir lock_file lock_fd module_name payload
     local legacy_path extension state resolved_path marker identity current_identity
     local lock_existed=0
     local -a modules=("$CORE_MODULE" "$I2C_MODULE")
-    local -a legacy_to_remove=()
+    local -a legacy_paths=()
     local -a markers=()
     declare -A payloads=()
-    declare -A marker_identities=()
     declare -A legacy_identities=()
+    declare -A marker_identities=()
 
     validate_kernel_name "$kernel" || return 1
     if [[ ! -d "${MODULE_ROOT}/${kernel}" ]]; then
@@ -619,28 +684,34 @@ finalize_kernel() (
     done
 
     expected_owner="kmod-galaxybook-max98390-${kernel}"
+    wait_for_package_evr "$COMMON_PACKAGE" || return 1
+    expected_evr="$RPM_PACKAGE_EVR"
     expected_dir="${MODULE_ROOT}/${kernel}/extra/galaxybook-max98390/sound/hda/codecs/side-codecs"
 
-    # Validate the complete replacement set before querying or removing any
-    # historical override. Validation is exact for package owner and vermagic.
+    # Validate the complete replacement set before examining any historical
+    # override. Validation is exact for package owner, EVR and vermagic.
     for module_name in "${modules[@]}"; do
         payload="$(find_module_payload "$expected_dir" "$module_name")" || return 1
         payloads["$module_name"]="$payload"
     done
     for module_name in "${modules[@]}"; do
         payload="${payloads[$module_name]}"
-        wait_for_expected_owner "$payload" "$expected_owner" || return 1
+        wait_for_expected_owner "$payload" "$expected_owner" "$expected_evr" || return 1
         validate_payload_vermagic "$kernel" "$payload" || return 1
     done
 
-    # Resolve ownership for every legacy candidate before deleting the first
-    # one, so an RPM database error cannot result in a partial cleanup.
+    # Never delete or adopt an override that is not owned by this package.
+    # The packaged depmod override gives the validated family payload explicit
+    # priority while retaining a local legacy copy as a non-destructive
+    # fallback when the package payload is absent.
     for module_name in "${modules[@]}"; do
         for extension in ko ko.xz ko.zst ko.gz; do
             legacy_path="${MODULE_ROOT}/${kernel}/updates/sound/hda/codecs/side-codecs/${module_name}.${extension}"
             [[ -e "$legacy_path" || -L "$legacy_path" ]] || continue
 
             identity="$(legacy_metadata "$legacy_path")" || return 1
+            legacy_paths+=("$legacy_path")
+            legacy_identities["$legacy_path"]="$identity"
 
             if rpm_owner_state "$legacy_path"; then
                 log "Preserving RPM-owned legacy path $legacy_path ($RPM_OWNER)"
@@ -650,25 +721,17 @@ finalize_kernel() (
             fi
 
             if (( state == 1 )); then
-                legacy_to_remove+=("$legacy_path")
-                legacy_identities["$legacy_path"]="$identity"
+                log "Preserving unmanaged legacy override $legacy_path; packaged depmod policy must select the RPM payload"
             else
                 error "Could not safely determine RPM ownership of $legacy_path"
                 return 1
             fi
         done
     done
-
-    for legacy_path in "${legacy_to_remove[@]}"; do
+    for legacy_path in "${legacy_paths[@]}"; do
         identity="$(legacy_metadata "$legacy_path")" || return 1
         if [[ "$identity" != "${legacy_identities[$legacy_path]}" ]]; then
-            error "Legacy override changed after ownership validation: $legacy_path"
-            return 1
-        fi
-        log "Removing unmanaged legacy override $legacy_path"
-        rm -f -- "$legacy_path"
-        if [[ -e "$legacy_path" || -L "$legacy_path" ]]; then
-            error "Legacy override remained after removal: $legacy_path"
+            error "Legacy override changed during validation: $legacy_path"
             return 1
         fi
     done

@@ -34,8 +34,8 @@ Este repositorio organiza ese soporte siguiendo el patrón de Fedora:
 
 - módulos externos reconstruidos y entregados por kernel con `akmods`;
 - una cola duradera que finaliza cada kmod después de que termine la transacción
-  RPM, validando propietario, `vermagic`, `depmod` y resolución antes de borrar
-  cualquier override legado no gestionado;
+  RPM, validando propietario, `vermagic`, `depmod` y resolución sin borrar ni
+  adoptar ningún override legado no gestionado;
 - un mutex global autenticado que serializa el mantenimiento de los índices de
   módulos con otros drivers Galaxy Book, incluso durante un `dracut` paralelo;
 - un servicio de arranque que espera a `akmods`, carga explícitamente los dos
@@ -121,7 +121,7 @@ Repita esta validación después de cada actualización del kernel. La prueba
 definitiva sigue siendo reproducir audio por los altavoces internos después de
 arrancar con el nuevo kernel.
 
-Desde la versión `1.00.11`, las integraciones que hayan terminado el build de
+Desde la versión `1.00.12`, las integraciones que hayan terminado el build de
 un kernel pueden esperar la finalización completa fuera de la transacción RPM:
 
 ```bash
@@ -129,10 +129,13 @@ sudo /usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh \
   --kernel "$kernel_release"
 ```
 
-El comando solo devuelve éxito después de validar los dos propietarios RPM y
-valores `vermagic` exactos, borrar únicamente overrides legados sin propietario,
-ejecutar `depmod` y confirmar la resolución exacta de ambos módulos. La cola
-automática usa el mismo contrato y conserva solicitudes interrumpidas.
+El comando solo devuelve éxito después de validar los propietarios y EVRs RPM
+exactos de ambos payloads, sus valores `vermagic`, ejecutar `depmod` y confirmar
+la resolución exacta de ambos módulos. Un override legado sin propietario se conserva. La regla
+`depmod.d` del paquete da prioridad solamente a los dos módulos validados en
+`extra/galaxybook-max98390`; si ese payload no existe, la copia en `updates`
+sigue disponible como fallback. La cola automática usa el mismo contrato y
+conserva solicitudes interrumpidas.
 
 Antes del lock privado de MAX98390 y del lock compartido de RPM, el finalizador
 adquiere el mutex BSD exclusivo
@@ -141,7 +144,46 @@ heredar el descriptor autenticado, que permanece válido hasta confirmar el
 marcador. Se revalidan los ancestros, propietario, modo `0600`, cantidad de
 hardlinks e identidad `device:inode` entre path y FD. La espera está limitada a
 diez minutos; un fallo de adquisición conserva la cola e impide que comiencen
-`depmod` o la limpieza.
+`depmod` o la inspección de los overrides legados.
+
+Los scriptlets `%post` y `%postun` de los RPM específicos por kernel son no-op
+intencionalmente: adquirir el mutex dentro de la transacción invertiría el
+orden RPM → global y podría causar un deadlock. La instalación queda en cola
+mediante el trigger del paquete común y se finaliza después de la transacción.
+La eliminación automática y segura de los módulos no está soportada en esta
+versión: `%postun` también es no-op y una futura API del paquete deberá
+coordinar la eliminación fuera de la transacción. Conserve el paquete común
+durante cualquier eliminación planificada y no ejecute un `depmod` aislado en
+paralelo con actualizaciones de drivers.
+
+Durante las actualizaciones del paquete común, `%pretrans` incorpora un
+coordinador que registra un snapshot autenticado, arma una recuperación
+persistente y enmascara/drena el watcher, el servicio I2C dependiente y el
+worker antes del reemplazo. Cuando sale el writer RPM, la recuperación solo
+abre un grafo `all-new` coherente. Un legado público sin worker puede recuperar
+esa ausencia original; un worker antiguo inseguro o un estado mixto permanece
+enmascarado para que lo adopte una actualización compatible. Todos los starts
+son asíncronos para evitar una inversión RPM → mutex global. Si ya están
+instalados, los peers deben ser `galaxybook-ov02c10-kmod-common >= 1.00.25` y
+`galaxybook-setup >= 1.00.48`; estas dependencias condicionales no instalan
+peers ausentes.
+
+Este bootstrap de migración requiere un manager `systemd` activo. En un chroot
+o una raíz offline, los scriptlets no contactan el manager, por lo que no arman
+la recuperación ni comprueban el preset y la activación de las unidades
+introducidas por la actualización. No considere completa la migración inicial
+en ese modo: repita la transacción del paquete común en una sesión live y
+valide el watcher. Tras una recuperación live correcta, el watcher persistente
+cubre los reinicios posteriores; no se crea ningún servicio permanente
+adicional.
+
+Un downgrade explícito queda fuera de este contrato de recuperación. El solver
+normal rechaza un MAX98390 anterior a `1.00.12` cuando los peers coordinados
+están presentes. No fuerce un downgrade coordinado, elimine esos peers ni
+instale un build anterior con `--nodeps`: esos builds carecen del coordinador
+actual y el WIP local `1.00.11` incluía un worker que eliminaba overrides
+legados. La ruta `all-old` solo restaura un snapshot preexistente; no autoriza
+un downgrade de paquete.
 
 ## Alcance
 
@@ -167,7 +209,8 @@ repositorios de esta línea.
 
 - `module/`: fuentes de `snd-hda-scodec-max98390` y
   `snd-hda-scodec-max98390-i2c`
-- `scripts/`: helpers de finalización por kernel, arranque y soporte nativo
+- `scripts/`: helpers de finalización por kernel, filtro fail-closed de
+  `kmodtool`, arranque y soporte nativo
 - `data/`: units de `systemd`
 - `packaging/fedora/`: spec RPM/akmod y generación del payload por kernel
 
