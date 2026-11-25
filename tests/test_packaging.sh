@@ -434,15 +434,30 @@ test_kmodtool_filter_is_a_fail_closed_build_source() {
         '/usr/bin/bash "%{SOURCE1}" --expected-kernels' \
         'spec does not run kmodtool through the queue-only filter'
     assert_file_contains_fixed "$SPEC" \
+        '%if %{exists:/usr/bin/kmodtool}' \
+        'spec cannot defer kmodtool until binary BuildRequires are installed'
+    assert_file_contains_fixed "$SPEC" \
         '%if %{kmodtool_queue_only_filter_ok} != 1' \
         'spec does not require the exact kmodtool filter success sentinel'
+    assert_file_contains_fixed "$SPEC" \
+        '%global kmodtool_queue_only_build_verified 1' \
+        'successful filtering does not authorize the binary build stages'
+    assert_file_contains_fixed "$SPEC" \
+        '%global kmodtool_queue_only_filter_deferred 1' \
+        'source-only bootstrap does not record deferred filtering'
+    assert_file_contains_fixed "$SPEC" \
+        '%{?kernels:%{error:kmodtool is required to generate a source RPM with explicit kernels}}' \
+        'source-only bootstrap can discard an explicit kernel payload request'
+    assert_file_contains_fixed "$SPEC" \
+        'kmodtool queue-only filtering was deferred; refusing an unverified binary build' \
+        'binary prep does not fail closed after source-only bootstrap'
     assert_file_contains_fixed "$KMODTOOL_FILTER" \
         '> "${kmodtool_queue_only_temp_dir}/command.stdout"' \
         'kmodtool filter does not buffer upstream output before validation'
     assert_file_contains_fixed "$MAKEFILE" \
         'cp "$(KMODTOOL_FILTER)" "$(RPMBUILD_DIR)/SOURCES/"' \
         'RPM build does not stage the declared kmodtool filter source'
-    for dependency in bash coreutils diffutils; do
+    for dependency in akmods bash coreutils diffutils kmodtool; do
         assert_file_contains_fixed "$SPEC" "BuildRequires:  $dependency" \
             "spec lacks kmodtool filter build dependency $dependency"
     done
