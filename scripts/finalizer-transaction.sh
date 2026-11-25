@@ -2000,6 +2000,19 @@ finalizer_transaction_rearm_graph() {
 		finalizer_transaction_restore_failed_quiescent
 		return 1
 	fi
+	if [[ "$service_was_active" -eq 0 && "$marker_status" -ne 0 ]]; then
+		# Prove the worker is idle before queuing any dependent or activator.
+		# A dependent may have Requires= on the worker and deliberately move it to
+		# activating as soon as its own non-blocking start is accepted.
+		finalizer_transaction_expected_rearmed_active_state service_expected_active \
+			"$finalizer_transaction_service_unit" "$mode" || return 1
+		finalizer_transaction_rearm_step finalizer_transaction_observe_unit_states \
+			"$finalizer_transaction_service_unit" || return 1
+		[[ "$finalizer_transaction_observed_active" == "$service_expected_active" ]] || {
+			finalizer_transaction_restore_failed_quiescent
+			return 1
+		}
+	fi
 	if [[ "$service_was_active" -eq 1 || "$marker_status" -eq 0 ]]; then
 		finalizer_transaction_rearm_step finalizer_transaction_run_quiet \
 			finalizer_transaction_run_systemctl reset-failed \
@@ -2020,16 +2033,6 @@ finalizer_transaction_rearm_graph() {
 		finalizer_transaction_restore_dependent_active_states "$mode" || return 1
 	finalizer_transaction_rearm_step \
 		finalizer_transaction_restore_activator_active_states "$mode" || return 1
-	if [[ "$service_was_active" -eq 0 && "$marker_status" -ne 0 ]]; then
-		finalizer_transaction_expected_rearmed_active_state service_expected_active \
-			"$finalizer_transaction_service_unit" "$mode" || return 1
-		finalizer_transaction_rearm_step finalizer_transaction_observe_unit_states \
-			"$finalizer_transaction_service_unit" || return 1
-		[[ "$finalizer_transaction_observed_active" == "$service_expected_active" ]] || {
-			finalizer_transaction_restore_failed_quiescent
-			return 1
-		}
-	fi
 }
 
 finalizer_transaction_cleanup_state() {

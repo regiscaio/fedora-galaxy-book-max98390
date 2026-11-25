@@ -166,6 +166,13 @@ instalados, os peers precisam ser `galaxybook-ov02c10-kmod-common >= 1.00.25` e
 `galaxybook-setup >= 1.00.48`; essas dependências condicionais não instalam
 peers ausentes.
 
+Máquinas em que `max98390-hda-i2c-setup.service` já estava ativo antes da
+migração precisam do pacote comum `1.00.14` ou posterior. A versão `1.00.13`
+pode repetir o rearm do recovery porque o `Requires=` do serviço I2C volta a
+enfileirar o worker. Durante esse reparo, não apague as máscaras runtime nem o
+estado autenticado da transação e não reinicie entre as fases: instale o
+upgrade compatível para que ele adote o estado preservado e conclua o recovery.
+
 Esse bootstrap de migração exige um `systemd` ativo. Em chroot ou numa raiz
 offline, os scriptlets não contatam o manager, portanto não armam o recovery
 nem comprovam o preset e a ativação das units introduzidas pelo upgrade. Não

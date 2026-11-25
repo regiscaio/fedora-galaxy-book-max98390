@@ -187,6 +187,7 @@ done
 		max_start_stage=0
 		max_worker_starts=0
 		max_concurrent_rejected=0
+		max_dependent_requires_worker=0
 		finalizer_transaction_run_quiet() { "$@"; }
 		finalizer_transaction_systemd_property() {
 			local output_variable="$1" unit="$2" property="$3" value
@@ -271,12 +272,27 @@ done
 						[[ "${max_mask[$unit]:-0}" -eq 0 ]] || return 73
 						[[ " $* " == *" --no-block "* ]] || return 74
 						((max_start_stage += 1))
-						case "$max_start_stage" in
-							1) [[ "$unit" == "$max_service" ]]; max_active["$unit"]=inactive ;;
-							2) [[ "$unit" == "$max_dependent" ]]; max_active["$unit"]=active ;;
-							3) [[ "$unit" == "$max_path" ]]; max_active["$unit"]=active ;;
-							*) return 1 ;;
-						esac
+						if [[ "$max_dependent_requires_worker" -eq 1 ]]; then
+							case "$max_start_stage" in
+								1)
+									[[ "$unit" == "$max_dependent" ]]
+									max_active["$unit"]=active
+									# The real unit has Requires= on the worker. Its accepted
+									# non-blocking job queues the worker without waiting for
+									# the cross-driver global lock.
+									max_active["$max_service"]=activating
+									;;
+								2) [[ "$unit" == "$max_path" ]]; max_active["$unit"]=active ;;
+								*) return 1 ;;
+							esac
+						else
+							case "$max_start_stage" in
+								1) [[ "$unit" == "$max_service" ]]; max_active["$unit"]=inactive ;;
+								2) [[ "$unit" == "$max_dependent" ]]; max_active["$unit"]=active ;;
+								3) [[ "$unit" == "$max_path" ]]; max_active["$unit"]=active ;;
+								*) return 1 ;;
+							esac
+						fi
 					done
 					;;
 				reset-failed) ;;
@@ -310,6 +326,33 @@ done
 		[[ "${max_persistent[$max_path]}" == enabled ]]
 		[[ "${max_persistent[$max_dependent]}" == enabled ]]
 		[[ "${max_persistent[$max_service]}" == enabled ]]
+
+		# With no marker and an originally idle worker, prove that idle state
+		# before restoring a previously active dependent. Starting that dependent
+		# queues the worker through Requires=; this must not be mistaken for a
+		# concurrent worker after the non-blocking start is accepted.
+		rm -f -- "${max_pending}/kernel.pending"
+		max_active["$max_path"]=active
+		max_active["$max_dependent"]=active
+		max_active["$max_service"]=inactive
+		max_mask_seen=0
+		max_stop_stage=0
+		max_unmask_stage=0
+		max_start_stage=0
+		max_worker_starts=0
+		max_concurrent_rejected=0
+		max_dependent_requires_worker=1
+		finalizer_transaction_mask_and_drain
+		[[ "$max_mask_seen" -eq 1 && "$max_stop_stage" -eq 3 ]]
+		finalizer_transaction_rearm_graph new
+		[[ "$max_unmask_stage" -eq 2 && "$max_concurrent_rejected" -eq 1 ]]
+		[[ "$max_start_stage" -eq 2 && "$max_worker_starts" -eq 1 ]]
+		[[ "${max_active[$max_path]}" == active ]]
+		[[ "${max_active[$max_dependent]}" == active ]]
+		[[ "${max_active[$max_service]}" == activating ]]
+		for unit in "${finalizer_transaction_all_units[@]}"; do
+			[[ "${max_mask[$unit]}" -eq 0 ]]
+		done
 		finalizer_transaction_publish_ready() { return 0; }
 		finalizer_transaction_acquire_rpm_lock() { return 0; }
 		finalizer_transaction_snapshot_current_packages() { return 0; }
@@ -321,7 +364,7 @@ done
 		finalizer_transaction_recover AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
 			>/dev/null 2>&1 || max_old_status=$?
 		[[ "$max_old_status" -eq 75 ]]
-		[[ "$max_unmask_stage" -eq 2 && "$max_worker_starts" -eq 2 ]]
+		[[ "$max_unmask_stage" -eq 2 && "$max_worker_starts" -eq 1 ]]
 		for unit in "${finalizer_transaction_all_units[@]}"; do
 			[[ "${max_mask[$unit]}" -eq 1 ]]
 		done
@@ -2014,8 +2057,27 @@ done
 mock_fail_daemon_reload_at=0
 mock_recovery_active=active
 fixture_set_cgroup "$recovery_cgroup" 1
+# Model a published prior generation whose authenticated state is still valid
+# while its private recovery helper has older bytes. A replacement scriptlet
+# running under the RPM writer lock must not query rpmdb; it retires the stale
+# transient and installs the current helper without rewriting the snapshot.
+printf '#!/usr/bin/bash\nexit 99\n' > "$finalizer_transaction_helper_copy_path"
+chmod 0700 -- "$finalizer_transaction_helper_copy_path"
+stale_helper_sha="$(sha256sum "$finalizer_transaction_helper_copy_path" | {
+	read -r hash _
+	printf '%s' "$hash"
+})"
+current_helper_sha="$(sha256sum "$finalizer_transaction_script_path" | {
+	read -r hash _
+	printf '%s' "$hash"
+})"
+[[ "$stale_helper_sha" != "$current_helper_sha" ]] || \
+	fail 'stale-adoption fixture did not replace the prior helper bytes'
 : > "$event_log"
+saved_rpm_command="$finalizer_transaction_rpm_command"
+finalizer_transaction_rpm_command=/usr/bin/false
 finalizer_transaction_pretrans 2
+finalizer_transaction_rpm_command="$saved_rpm_command"
 assert_equal "$snapshot_sha" \
 	"$(sha256sum "$finalizer_transaction_state_path" | { read -r hash _; printf '%s' "$hash"; })" \
 	'stale adoption rewrote the original snapshot'
@@ -2031,6 +2093,9 @@ if event_line UNMASK >/dev/null 2>&1; then
 fi
 finalizer_transaction_helper_copy_is_authentic || \
 	fail 'stale adoption did not recreate byte-identical helper'
+cmp --silent -- "$finalizer_transaction_script_path" \
+	"$finalizer_transaction_helper_copy_path" || \
+	fail 'stale adoption did not install the current helper bytes'
 finalizer_transaction_ready_is_authentic || \
 	fail 'stale adoption did not recreate authenticated READY'
 
