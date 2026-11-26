@@ -30,6 +30,10 @@ instala um RPM `kmod-galaxybook-max98390-<versão-do-kernel>` para cada kernel,
 com os dois módulos destinados exatamente àquela versão. Um módulo compilado
 para outro kernel não é reutilizado.
 
+Desde a versão 1.00.16, um rebuild local só gera o RPM do kernel solicitado.
+Os serviços e o gatilho de finalização continuam no pacote comum do repositório;
+recompilar um módulo não reinstala esse pacote nem executa seu `%pretrans`.
+
 No 960XGL, após instalar o pacote comum, execute como usuário normal:
 
 ```bash

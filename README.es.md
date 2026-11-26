@@ -30,6 +30,10 @@ compila e instala un RPM `kmod-galaxybook-max98390-<versión-del-kernel>` para
 cada kernel, con los dos módulos destinados específicamente a esa versión. Un
 módulo compilado para otro kernel nunca se reutiliza.
 
+Desde la versión 1.00.16, una reconstrucción local solo genera el RPM del kernel
+solicitado. Los servicios y el disparador de finalización siguen en el paquete
+común del repositorio; recompilar el módulo no lo reinstala ni ejecuta su `%pretrans`.
+
 ## Objetivo
 
 Algunos Galaxy Book exponen la tarjeta de sonido con normalidad e incluso

@@ -7,7 +7,6 @@ REPO_ROOT="$(cd -- "$TEST_DIR/.." && pwd)"
 SPEC="$REPO_ROOT/packaging/fedora/galaxybook-max98390-kmod.spec"
 HELPER="$REPO_ROOT/scripts/finalizer-transaction.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/max98390-upgrade-quiescence-tests.XXXXXX")"
-KERNEL_VERSION="${KERNEL_VERSION:-7.3.4-200.fc44.x86_64}"
 COMMON_PACKAGE=galaxybook-max98390-kmod-common
 
 # shellcheck source=lib/harness.sh
@@ -39,7 +38,6 @@ read_rendered_scriptlets() {
         --qf $'PACKAGE=%{NAME}\nPRE-BEGIN\n[%{PRETRANSPROG}\n]PRE-END\nPOST-BEGIN\n[%{POSTTRANSPROG}\n]POST-END\nPOSTBODY-BEGIN\n%{POSTTRANS}\nPOSTBODY-END\n' \
         --define "_sourcedir $REPO_ROOT/scripts" \
         --define "_libexecdir $TEST_ROOT/libexec" \
-        --define "kernels $KERNEL_VERSION" \
         --define 'pkg_version_override 1.00.12' \
         "$SPEC" > "$metadata"
 

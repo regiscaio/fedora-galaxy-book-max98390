@@ -30,6 +30,10 @@ installs a `kmod-galaxybook-max98390-<kernel-release>` RPM for each kernel,
 containing the two modules built specifically for that release. A module built
 for another kernel is never reused.
 
+Starting with 1.00.16, a local rebuild emits only the requested kernel's RPM.
+The services and finalization trigger remain in the repository's common package;
+rebuilding a module does not reinstall that package or invoke its `%pretrans`.
+
 ## Goal
 
 Some Galaxy Book models expose the sound card normally and even show the

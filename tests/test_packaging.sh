@@ -79,14 +79,16 @@ test_systemd_preset_is_packaged() {
 }
 
 test_finalizer_is_ordered_and_transaction_safe() {
-    local expanded rhel_expanded trigger_body
+    local expanded rhel_expanded repo_expanded trigger_body
 
     command -v rpmspec >/dev/null 2>&1 || skip 'rpmspec is not installed'
     command -v kmodtool >/dev/null 2>&1 || skip 'kmodtool is not installed'
     new_packaging_fixture
     expanded="$PACKAGING_TMPDIR/expanded.spec"
+    repo_expanded="$PACKAGING_TMPDIR/repo.spec"
     rhel_expanded="$PACKAGING_TMPDIR/rhel-expanded.spec"
     trigger_body="$PACKAGING_TMPDIR/trigger.body"
+    rpmspec -P --define "_sourcedir $REPO_ROOT/scripts" "$SPEC" > "$repo_expanded"
     rpmspec -P \
         --define "_sourcedir $REPO_ROOT/scripts" \
         --define "kernels $KERNEL_VERSION" \
@@ -101,7 +103,7 @@ test_finalizer_is_ordered_and_transaction_safe() {
         /^%transfiletriggerin / { in_trigger = 1; next }
         in_trigger && /^%/ { exit }
         in_trigger { print }
-    ' "$expanded" > "$trigger_body"
+    ' "$repo_expanded" > "$trigger_body"
     assert_file_contains_fixed "$trigger_body" \
         '/usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh --from-rpm-trigger' \
         'RPM file trigger does not delegate to queue-only mode'
@@ -217,13 +219,24 @@ test_kmodtool_generates_kernel_payload_manifest() {
 }
 
 test_rpmspec_expands_per_kernel_payload() {
-    local output expected_payload
+    local output expected_payload actual expected
 
     command -v rpmspec >/dev/null 2>&1 || skip 'rpmspec is not installed'
     command -v kmodtool >/dev/null 2>&1 || skip 'kmodtool is not installed'
     new_packaging_fixture
     output="$PACKAGING_TMPDIR/rpmspec.out"
     expected_payload="/lib/modules/$KERNEL_VERSION/extra/galaxybook-max98390/"
+
+    # akmodsbuild hands every result to DNF; an extra common RPM would
+    # run its host-wide pretrans during a local --rebuild/reinstall.
+    actual=$(rpmspec -q --builtrpms --qf '%{NAME}\n' \
+        --define "_sourcedir $REPO_ROOT/scripts" --define "kernels $KERNEL_VERSION" "$SPEC")
+    [[ "$actual" == "kmod-galaxybook-max98390-$KERNEL_VERSION" ]] || \
+        fail "unexpected set of explicit-kernel RPMs: $actual"
+    actual=$(rpmspec -q --builtrpms --qf '%{NAME}\n' \
+        --define "_sourcedir $REPO_ROOT/scripts" "$SPEC" | LC_ALL=C sort)
+    expected=$'akmod-galaxybook-max98390\ngalaxybook-max98390-kmod-common\nkmod-galaxybook-max98390'
+    [[ "$actual" == "$expected" ]] || fail "unexpected repository RPMs: $actual"
 
     rpmspec -P \
         --define "_sourcedir $REPO_ROOT/scripts" \
@@ -241,9 +254,16 @@ test_rpmspec_expands_per_kernel_payload() {
         'expanded spec does not install the core module'
     assert_file_contains_fixed "$output" 'snd-hda-scodec-max98390-i2c.ko' \
         'expanded spec does not install the I2C module'
-    assert_file_contains_fixed "$output" \
-        '/usr/libexec/galaxybook-max98390/max98390-kmod-finalize.sh --from-rpm-trigger' \
-        'expanded RPM trigger does not use the queue-only finalizer mode'
+    assert_file_not_contains_fixed "$output" '%transfiletriggerin' \
+        'kernel rebuild redeclared the file trigger owned by the installed common package'
+    assert_file_not_contains_fixed "$output" '%package -n galaxybook-max98390-kmod-common' \
+        'kernel rebuild would reinstall the repository common package'
+    assert_file_not_contains_fixed "$output" '/usr/libexec/galaxybook-max98390/' \
+        'kernel rebuild unexpectedly stages the common helpers'
+    assert_file_not_contains_fixed "$output" '/var/lib/galaxybook-max98390/' \
+        'kernel rebuild unexpectedly stages the host-wide queue directories'
+    assert_file_contains_fixed "$output" 'galaxybook-max98390-kmod-common >=' \
+        'kernel rebuild no longer depends on a compatible repository common package'
 
     awk -v payload="$expected_payload" '
         /^%files[[:space:]]+-n[[:space:]]+kmod-galaxybook-max98390-/ &&
