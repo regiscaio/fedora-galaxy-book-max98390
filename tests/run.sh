@@ -5,7 +5,14 @@ set -euo pipefail
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 failures=0
 
+for test_python in test_redrix_profiles.py test_samsung_dsm_extract.py; do
+    if ! python3 -B "$TEST_DIR/$test_python"; then
+        failures=$((failures + 1))
+    fi
+done
+
 for test_script in \
+    "$TEST_DIR/test_oem_driver.sh" \
     "$TEST_DIR/test_i2c_setup.sh" \
     "$TEST_DIR/test_kmodtool_filter.sh" \
     "$TEST_DIR/test_srpm_bootstrap.sh" \

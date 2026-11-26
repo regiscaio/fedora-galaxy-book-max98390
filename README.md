@@ -13,6 +13,13 @@ Ultra.
 
 ## Instalação rápida
 
+No Galaxy Book4 Ultra 960XGL com ALC298 `144d:c1d8`, a linha 1.00.15 exige
+o perfil original dos quatro amplificadores. Sem o perfil certo, o driver não
+liga os alto-falantes nem usa parâmetros do Chromebook Redrix como substituto.
+O RPM não inclui o firmware proprietário. Obtenha o `ADIAmpDriver.sys` 1.0.0.44
+da sua instalação licenciada ou o [CAB correspondente no catálogo da Microsoft](https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=9cd3303f-03c3-4f72-8631-ffc3383f6393),
+se os termos permitirem esse uso. O extrator não baixa nem executa o driver.
+
 ```bash
 sudo dnf config-manager addrepo --from-repofile=https://packages.caioregis.com/fedora/caioregis.repo
 sudo dnf install akmod-galaxybook-max98390
@@ -22,6 +29,20 @@ O pacote `akmod` contém os fontes e a receita de build. O `akmods` compila e
 instala um RPM `kmod-galaxybook-max98390-<versão-do-kernel>` para cada kernel,
 com os dois módulos destinados exatamente àquela versão. Um módulo compilado
 para outro kernel não é reutilizado.
+
+No 960XGL, após instalar o pacote comum, execute como usuário normal:
+
+```bash
+/usr/libexec/galaxybook-max98390/prepare-samsung-dsm.py /caminho/ADIAmpDriver.sys -o max98390-galaxybook.bin
+```
+
+Também se aceita o CAB original em vez do `.sys`, se `cabextract` estiver
+instalado. O arquivo validado tem 1.522 bytes e SHA-256
+`a704dcca7fb740779616826dcad3f4e195fbc51af0b59bc943dfb5a00bad7e68`.
+O destino final é `/usr/lib/firmware/max98390-galaxybook.bin`. Use o fluxo de
+manutenção do Setup para instalar os módulos; não force sua descarga nem
+substitua firmware local diferente sem verificar. Depois da ativação, confira
+os quatro vínculos I²C e faça um teste de reprodução em volume baixo.
 
 ## Objetivo
 

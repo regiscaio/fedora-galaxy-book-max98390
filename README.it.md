@@ -13,6 +13,13 @@ iniziale sul Galaxy Book4 Ultra.
 
 ## Installazione rapida
 
+Sul Galaxy Book4 Ultra 960XGL con ALC298 `144d:c1d8`, la versione 1.00.15
+richiede il profilo Samsung dei quattro amplificatori. Il pacchetto non include
+dati proprietari e non sostituisce il profilo con i parametri Redrix. Usare
+`/usr/libexec/galaxybook-max98390/prepare-samsung-dsm.py` con una copia locale
+autorizzata di ADIAmpDriver.sys 1.0.0.44 oppure del suo CAB. Vedere le
+[istruzioni](README.md#instalação-rápida).
+
 ```bash
 sudo dnf config-manager addrepo --from-repofile=https://packages.caioregis.com/fedora/caioregis.repo
 sudo dnf install akmod-galaxybook-max98390

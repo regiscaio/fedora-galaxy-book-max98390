@@ -736,7 +736,9 @@ finalize_kernel() (
         fi
     done
 
-    if ! "$DEPMOD_COMMAND" -a "$kernel"; then
+    # kmod's system-wide indexes must also be readable by unprivileged clients.
+    # Do not relax the private lock/state umask anywhere else in this worker.
+    if ! (umask 022 && "$DEPMOD_COMMAND" -a "$kernel"); then
         error "depmod failed for $kernel"
         return 1
     fi

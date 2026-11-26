@@ -267,6 +267,27 @@ test_unmanaged_legacy_is_preserved_and_priority_allows_activation() {
     grep -Fq -- "Preserving unmanaged legacy override $legacy" "$output"
 }
 
+test_regenerates_public_indexes_without_exposing_private_lock() (
+    local kernel=7.1.8-depmod-modes.x86_64 base="$TEST_ROOT/depmod-fixture"
+    local index_dir="$base/lib/modules/$kernel" index
+    umask 077
+    new_kernel_fixture "$kernel"
+    mkdir -p "$index_dir"
+    touch "$index_dir"/{modules.order,modules.builtin,modules.builtin.modinfo}
+    # Use real kmod in an empty fixture, never the host module tree. Seed the
+    # broken modes from the previous release before exercising the finalizer.
+    /usr/bin/depmod -b "$base" -a "$kernel"
+    [[ "$(stat -c %a "$index_dir/modules.dep.bin")" == 600 ]]
+    fixture_depmod() { /usr/bin/depmod -b "$base" "$@"; }
+    DEPMOD_COMMAND=fixture_depmod
+    finalize_kernel "$kernel" >/dev/null
+    for index in modules.dep{,.bin} modules.alias{,.bin} modules.symbols{,.bin}; do
+        [[ "$(stat -c %a "$index_dir/$index")" == 644 ]] || return 1
+    done
+    [[ "$(stat -c %a "$LOCK_ROOT/galaxybook-max98390-${kernel}.lock")" == 600 ]]
+    [[ "$(stat -c %a "$kmod_lifecycle_lock_path")" == 600 && "$(umask)" == 0077 ]]
+)
+
 test_owner_or_vermagic_failure_preserves_legacy() {
     local owner_kernel=7.1.8-owner-fail.x86_64 owner_legacy
     local vermagic_kernel=7.1.8-vermagic-fail.x86_64 vermagic_legacy
@@ -989,6 +1010,7 @@ test_inherited_global_lock_is_reused_before_private_and_rpm() {
 }
 
 test_unmanaged_legacy_is_preserved_and_priority_allows_activation
+test_regenerates_public_indexes_without_exposing_private_lock
 test_owner_or_vermagic_failure_preserves_legacy
 test_stale_payload_evr_preserves_marker_without_depmod
 test_success_status_with_trailing_rpm_diagnostic_is_rejected

@@ -122,6 +122,8 @@ install -m 0644 README.md %{buildroot}%{_datadir}/doc/%{pkg_kmod_name}/README.md
 install -d %{buildroot}%{_datadir}/licenses/%{name}
 install -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 install -d %{buildroot}%{_libexecdir}/%{prjname}
+install -m 0755 scripts/prepare-samsung-dsm.py \
+  %{buildroot}%{_libexecdir}/%{prjname}/prepare-samsung-dsm.py
 install -m 0755 scripts/max98390-hda-i2c-setup.sh \
   %{buildroot}%{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 install -m 0755 scripts/max98390-hda-check-upstream.sh \
@@ -176,6 +178,7 @@ done
 %files -n %{pkg_kmod_name}-common
 %{_datadir}/doc/%{pkg_kmod_name}/README.md
 %license %{_datadir}/licenses/%{name}/LICENSE
+%{_libexecdir}/%{prjname}/prepare-samsung-dsm.py
 %{_libexecdir}/%{prjname}/max98390-hda-i2c-setup.sh
 %{_libexecdir}/%{prjname}/max98390-hda-check-upstream.sh
 %{_libexecdir}/%{prjname}/max98390-kmod-finalize.sh

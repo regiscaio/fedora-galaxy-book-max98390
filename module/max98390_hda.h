@@ -21,6 +21,10 @@ struct max98390_hda_priv {
 	int index;
 	const char *acpi_subsystem_id;
 	int i2c_addr;  /* I2C address for speaker identification */
+	bool oem;
+	bool ready;
+	const u8 *oem_regs, *oem_dsm;
+	unsigned int oem_nregs, oem_ndsm;
 };
 
 int max98390_hda_probe(struct device *dev, const char *device_name,

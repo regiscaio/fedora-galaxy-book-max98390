@@ -14,6 +14,7 @@
 #include "hda_generic.h"
 #include "max98390_hda.h"
 #include "max98390_hda_filters.h"
+#include "max98390_oem.h"
 #include "max98390_regs.h"
 
 static int max98390_hda_write_checked(struct max98390_hda_priv *priv,
@@ -31,8 +32,8 @@ static int max98390_hda_write_checked(struct max98390_hda_priv *priv,
 
 static void max98390_hda_disable(struct max98390_hda_priv *priv)
 {
-	max98390_hda_write_checked(priv, MAX98390_R203A_AMP_EN, 0x80);
 	max98390_hda_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0x00);
+	max98390_hda_write_checked(priv, MAX98390_R203A_AMP_EN, 0x80);
 }
 
 static void max98390_hda_playback_hook(struct device *dev, int action)
@@ -43,14 +44,13 @@ static void max98390_hda_playback_hook(struct device *dev, int action)
 	switch (action) {
 	case HDA_GEN_PCM_ACT_OPEN:
 
-		/* Enable global and speaker amp */
-		ret = regmap_write(priv->regmap, MAX98390_R23FF_GLOBAL_EN, 0x01);
-		if (ret < 0)
-			dev_err(dev, "Failed to write GLOBAL_EN: %d\n", ret);
-
-		ret = regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x81);
-		if (ret < 0)
-			dev_err(dev, "Failed to write AMP_EN: %d\n", ret);
+		if (!priv->ready)
+			break;
+		ret = max98390_hda_write_checked(priv, MAX98390_R203A_AMP_EN, 0x81);
+		if (!ret)
+			ret = max98390_hda_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0x01);
+		if (ret)
+			max98390_hda_disable(priv);
 
 		break;
 
@@ -165,6 +165,8 @@ static int max98390_hda_init(struct max98390_hda_priv *priv)
 		return ret;
 
 	/* Configure filters and load DSM firmware */
+	if (priv->oem)
+		return max98390_oem_program(priv);
 	return max98390_configure_filters(priv);
 }
 
@@ -191,14 +193,20 @@ int max98390_hda_probe(struct device *dev, const char *device_name,
 	priv->i2c_addr = i2c_addr;
 	dev_set_drvdata(dev, priv);
 
+	/* Check the board, address and complete profile before any hardware write. */
+	ret = max98390_oem_prepare(priv);
+	if (ret)
+		return ret;
 	ret = max98390_hda_init(priv);
 	if (ret) {
 		max98390_hda_disable(priv);
 		return ret;
 	}
 
+	priv->ready = true;
 	ret = component_add(dev, &max98390_hda_comp_ops);
 	if (ret) {
+		priv->ready = false;
 		max98390_hda_disable(priv);
 		return ret;
 	}
@@ -225,6 +233,10 @@ static int max98390_hda_runtime_suspend(struct device *dev)
 	struct max98390_hda_priv *priv = dev_get_drvdata(dev);
 	int ret;
 
+	priv->ready = false;
+	ret = max98390_hda_write_checked(priv, MAX98390_R23FF_GLOBAL_EN, 0);
+	if (ret)
+		return ret;
 	ret = regmap_write(priv->regmap, MAX98390_R203A_AMP_EN, 0x80);
 	if (ret < 0)
 		return ret;
@@ -237,9 +249,15 @@ static int max98390_hda_runtime_suspend(struct device *dev)
 static int max98390_hda_runtime_resume(struct device *dev)
 {
 	struct max98390_hda_priv *priv = dev_get_drvdata(dev);
+	int ret;
 
 	regcache_cache_only(priv->regmap, false);
-	return regcache_sync(priv->regmap);
+	/* REGCACHE_NONE cannot restore OEM coefficients after a power loss. */
+	ret = max98390_hda_init(priv);
+	if (ret)
+		max98390_hda_disable(priv);
+	priv->ready = !ret;
+	return ret;
 }
 
 const struct dev_pm_ops max98390_hda_pm_ops = {

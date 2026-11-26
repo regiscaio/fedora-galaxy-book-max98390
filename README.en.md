@@ -13,6 +13,13 @@ Galaxy Book4 Ultra.
 
 ## Quick install
 
+On the Galaxy Book4 Ultra 960XGL with ALC298 subsystem `144d:c1d8`, version
+1.00.15 requires the matching Samsung amp profile; it never substitutes Redrix
+tuning. The proprietary data is not included. Use the installed offline
+`/usr/libexec/galaxybook-max98390/prepare-samsung-dsm.py` with an authorized
+local copy of ADIAmpDriver.sys 1.0.0.44 or its original CAB. See the
+[extraction and installation notes](README.md#instalação-rápida).
+
 ```bash
 sudo dnf config-manager addrepo --from-repofile=https://packages.caioregis.com/fedora/caioregis.repo
 sudo dnf install akmod-galaxybook-max98390
